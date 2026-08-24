@@ -53,9 +53,25 @@ CREATE TABLE IF NOT EXISTS image (
     width      INTEGER NOT NULL,
     height     INTEGER NOT NULL,
     byte_size  INTEGER NOT NULL,
-    face_count SMALLINT NOT NULL DEFAULT 0,  -- 0 => barren, skip on recrawl
+
+    -- Tri-state, and the distinction is load-bearing:
+    --   -1  never examined by a detector   (the crawl tier writes this)
+    --    0  examined, no qualifying face   => barren, skip on recrawl
+    --   >0  this many faces indexed
+    --
+    -- This defaulted to 0 and that was a bug. The crawl tier runs with no model
+    -- in the loop, so every row it wrote claimed "examined, no faces". On the
+    -- next startup Deduper.load() read those as barren and week 2 would have
+    -- skipped the entire corpus -- a silent, total loss of face extraction that
+    -- would have presented as a model failure. Caught by
+    -- test_resume_does_not_mark_unexamined_images_barren.
+    face_count SMALLINT NOT NULL DEFAULT -1,
+    CONSTRAINT face_count_valid CHECK (face_count >= -1),
+
     first_seen TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Work queue for the indexing pass: everything the detector has not seen.
+CREATE INDEX IF NOT EXISTS image_unexamined_idx ON image (id) WHERE face_count < 0;
 -- PDQ near-duplicate lookup is done in the app via a BK-tree seeded from this
 -- column; the btree here is only for the exact-PDQ fast path.
 CREATE INDEX IF NOT EXISTS image_pdq_idx ON image (pdq) WHERE pdq IS NOT NULL;

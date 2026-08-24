@@ -27,12 +27,13 @@ Prove extraction and storage before adding a model to the loop.
       — `index/store.py`. Dedup is seeded from the `image` table at startup, so
       resume is correct by construction. `--sink postgres` is now the default;
       `--sink jsonl` remains for throwaway runs.
-- [ ] **Verify the writer against a live Postgres.** Written and unit-tested,
-      but its 8 integration tests have never run — Docker needs WSL2, which is
-      not installed on this machine. Blocked on an elevated `wsl --install`
-      and a reboot.
-- [ ] Full FOSDEM archive run (~5 h at 1 rps across 13 years) — do this
-      *after* the writer is verified, not before
+- [x] **Verify the writer against a live Postgres** — WSL2 installed, Docker
+      up, schema auto-applied by the initdb mount. 10 integration tests pass
+      and are repeatable. Two budgeted runs over one frontier produced 65
+      pages / 40 images with zero duplicates, 40 of 40 carrying weak labels.
+      Found three real bugs in the process; see
+      [[seed-vertical-conference-speakers]].
+- [ ] Full FOSDEM archive run (~5 h at 1 rps across 13 years)
 - [ ] Crawl to 100k images
 - [ ] Report: images/host, extraction source breakdown, robots exclusion rate
       — `CrawlStats.report()` already emits all three

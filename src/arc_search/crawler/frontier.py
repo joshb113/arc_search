@@ -154,6 +154,20 @@ class Frontier:
         )
         return requeue
 
+    def release(self, url: str) -> None:
+        """Return a leased URL to PENDING without counting an attempt.
+
+        Distinct from both ``complete`` and ``fail``: the URL was never judged
+        on its merits, the run simply stopped being allowed to fetch it. It
+        must stay claimable by the next run.
+
+        This exists because the page-budget check used to call ``complete()``.
+        A 20-page smoke run marked 1,347 URLs DONE, of which 1,327 had never
+        been fetched -- so ``--max-pages`` silently consumed the frontier and
+        "crawl some tonight, more tomorrow" did nothing on the second night.
+        """
+        self._db.execute("UPDATE frontier SET state = ? WHERE url_key = ?", (PENDING, url_key(url)))
+
     def recover_inflight(self) -> int:
         """Reset rows left in-flight by a crash. Call once at startup."""
         cur = self._db.execute("UPDATE frontier SET state = ? WHERE state = ?", (PENDING, INFLIGHT))

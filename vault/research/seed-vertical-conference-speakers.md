@@ -96,6 +96,63 @@ Two things the run taught that reading the HTML did not:
   (speakers + events). At 1 rps that is ~22 min/year, so ~5 hours for the full
   13-year archive. Comfortable.
 
+## Threshold calibration, 2026-08-24
+
+Sampled 9 FOSDEM 2025 speaker photos directly. The result killed two shipped
+defaults:
+
+| | range | old default | outcome |
+|---|---|---|---|
+| short side | 165–180 px | `min_image_dim = 200` | **rejected 9 of 9** |
+| byte size | 5,399–66,114 B | `min_image_bytes = 8000` | **rejected 4 of 9** |
+
+Both were magic numbers, which non-negotiable #5 forbids, and between them they
+discarded the entire corpus with no error and no log line. The crawl would have
+completed, the index would have been empty, and it would have looked like a
+model problem.
+
+New values, and their derivations:
+
+- `min_image_dim = 64`, **derived** from `FaceSettings.min_face_px`. An image
+  whose shorter side is under the smallest face we would accept cannot contain
+  a qualifying face. `test_min_image_dim_is_not_above_the_minimum_face_size`
+  pins the two together so they cannot drift apart again.
+- `min_image_bytes = 2000`, and explicitly a *bandwidth* filter, not a quality
+  gate. Its only job is to avoid paying for tracking pixels and spacers, which
+  are under 1 KB. Quality is decided by the dimension floor and by the face
+  quality gate after detection.
+
+Confirmed against the live corpus afterwards: the smallest accepted image is
+3,040 B and the smallest short side is 116 px (`Photo of Aditi`, 116x180 at
+4,522 B) — a perfectly usable portrait that both old thresholds rejected.
+
+## First Postgres run, 2026-08-24
+
+Two budgeted runs over one frontier and one database, `/2025/` only.
+
+| | run A | run B | total |
+|---|---|---|---|
+| pages fetched | 20 | 45 | 65 |
+| images fetched | 7 | 33 | 40 |
+| `image` rows | 7 | +33 | 40 |
+
+Verified in the database afterwards: **40 of 40 images carry a `Photo of NAME`
+weak label**, all 40 sit at `face_count = -1` (never examined), none at 0, and
+UTF-8 survives the round trip (`Photo of Adolfo García Veytia`).
+
+Two bugs surfaced here that unit tests could not have caught:
+
+1. **`face_count` defaulted to 0**, which `Deduper` reads as *barren — never
+   look again*. The crawl tier has no detector, so every row it wrote claimed
+   to have been examined and found empty. On the next startup the whole corpus
+   loaded as barren and week 2 would have skipped all of it. Now `-1`, with a
+   CHECK constraint and a partial index serving as the indexer's work queue.
+2. **The page budget called `complete()`**, permanently marking budget-skipped
+   URLs DONE. Run A marked 1,347 URLs done having fetched 20. `--max-pages`
+   silently consumed the frontier, so "crawl some tonight, more tomorrow" did
+   nothing on the second night. Budget-skipped URLs are now `release()`d back
+   to PENDING.
+
 ## Caveats to carry into week 2
 
 - **FOSDEM photos are portraits.** A threshold calibrated on nothing but clean

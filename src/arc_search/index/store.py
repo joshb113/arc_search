@@ -50,6 +50,12 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = structlog.get_logger(__name__)
 
+# image.face_count is tri-state. This is the one the crawl tier writes: no
+# detector has looked at this image yet. It must NOT be 0 -- Deduper treats 0
+# as "examined and barren" and will skip the image forever. See the column
+# comment in sql/schema.sql.
+UNEXAMINED = -1
+
 
 def path_of(url: str) -> str:
     """Everything after the host: path plus query. Never the fragment."""
@@ -196,14 +202,19 @@ class PostgresWriter:
             return str(hit.verdict)
 
         digest = sha1_bytes(fetched.body)
+        # face_count is written EXPLICITLY as -1 rather than left to the column
+        # default. The convention only works if both halves agree, and relying
+        # on a default to carry a semantic this important is how they came to
+        # disagree in the first place: -1 was passed to Deduper.register() but
+        # never to the INSERT, so a resumed crawl read every row back as barren.
         row = self._conn.execute(
             """
-            INSERT INTO image (sha1, width, height, byte_size)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO image (sha1, width, height, byte_size, face_count)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (sha1) DO NOTHING
             RETURNING id
             """,
-            (digest, fetched.width, fetched.height, len(fetched.body)),
+            (digest, fetched.width, fetched.height, len(fetched.body), UNEXAMINED),
         ).fetchone()
 
         if row is None:
@@ -215,9 +226,7 @@ class PostgresWriter:
         else:
             image_id, verdict = row[0], "new"
 
-        # face_count=-1 means "not yet examined". 0 would mark it barren and
-        # cause week 2 to skip an image no detector has ever looked at.
-        self.dedup.register(digest, None, image_id, face_count=-1)
+        self.dedup.register(digest, None, image_id, face_count=UNEXAMINED)
         self._link(image_id, context)
         return verdict
 

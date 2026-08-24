@@ -236,6 +236,9 @@ class Crawler:
         self._inflight = 0
         self._stopping = False
         self._page_budget: Counter[str] = Counter()
+        # Verticals that have spent their per-run page budget. Page workers
+        # stop leasing once every active vertical is in here.
+        self._exhausted: set[str] = set()
         # Image URL -> the page context that found it. Populated at discovery,
         # consumed when the image is dequeued. Bounded by the image queue depth.
         self._ctx: dict[str, ImageContext] = {}
@@ -291,8 +294,14 @@ class Crawler:
             return
 
         if self._page_budget[vertical.name] >= vertical.max_pages:
+            # max_pages is a per-RUN cap, not a verdict on this URL. Release it
+            # so the next run can claim it; completing it here would burn the
+            # frontier permanently. Mark the vertical exhausted so the page
+            # workers wind down instead of spinning on a queue they may not
+            # touch.
             self.stats.note_skip("vertical_budget")
-            self._pages.complete(url)
+            self._exhausted.add(vertical.name)
+            self._pages.release(url)
             return
 
         try:
@@ -400,12 +409,26 @@ class Crawler:
     def stop(self) -> None:
         self._stopping = True
 
-    def _idle(self) -> bool:
-        s_pages, s_imgs = self._pages.stats(), self._images.stats()
-        return s_pages["pending"] == 0 and s_imgs["pending"] == 0 and self._inflight == 0
+    def pages_exhausted(self) -> bool:
+        """True once every active vertical has spent its per-run page budget.
 
-    async def _worker(self, frontier: Frontier, handler, tag: str) -> None:
+        Budget-skipped URLs are released back to PENDING rather than completed,
+        so the page queue never drains on a budgeted run. Without this the
+        workers would spin on it forever and the loop would never terminate.
+        """
+        active = self._seeds.active
+        return bool(active) and all(v.name in self._exhausted for v in active)
+
+    def _idle(self) -> bool:
+        # Pages left behind by an exhausted budget do not count as work
+        # remaining -- they are deliberately deferred to the next run.
+        pages_left = 0 if self.pages_exhausted() else self._pages.stats()["pending"]
+        return pages_left == 0 and self._images.stats()["pending"] == 0 and self._inflight == 0
+
+    async def _worker(self, frontier: Frontier, handler, tag: str, stop_when=None) -> None:
         while not self._stopping:
+            if stop_when is not None and stop_when():
+                return
             leased = frontier.lease(1)
             if not leased:
                 if self._idle():
@@ -436,7 +459,9 @@ class Crawler:
         n_img = max(1, self._cfg.concurrency - n_page)
 
         workers = [
-            asyncio.create_task(self._worker(self._pages, self._do_page, "page"))
+            asyncio.create_task(
+                self._worker(self._pages, self._do_page, "page", stop_when=self.pages_exhausted)
+            )
             for _ in range(n_page)
         ] + [
             asyncio.create_task(self._worker(self._images, self._do_image, "image"))

@@ -88,3 +88,33 @@ def test_the_shipped_env_example_has_no_typos():
             keys[k.strip()] = v.strip()
     assert keys, "no ARC_ keys found -- did the file move?"
     assert unknown_settings(keys) == []
+
+
+# --- filter thresholds must stay coupled to the face gate ------------------
+
+
+def test_min_image_dim_is_not_above_the_minimum_face_size():
+    """min_image_dim is DERIVED from min_face_px, not chosen independently.
+
+    The justification is: an image whose shorter side is smaller than the
+    smallest face we would accept cannot contain a qualifying face. If someone
+    raises min_image_dim above min_face_px, that reasoning stops holding and
+    the crawler starts discarding images that would have produced usable faces
+    -- silently, with no error and no log line.
+
+    This is not hypothetical. min_image_dim shipped at 200 while FOSDEM speaker
+    photos are 165-180px on the short side: it rejected 9 of 9 sampled images.
+    A whole corpus, no diagnostic.
+    """
+    assert CrawlSettings().min_image_dim <= FaceSettings().min_face_px
+
+
+def test_min_image_bytes_stays_a_bandwidth_filter_not_a_quality_gate():
+    """Real portraits are small. The smallest FOSDEM speaker photo in a 9-image
+    sample was 5,399 bytes; at the old 8,000 floor, 4 of 9 were discarded.
+
+    Tracking pixels and spacers are well under 1 KB, so anything at or below
+    ~2 KB does the intended job. Above that this silently becomes a quality
+    filter, which is not what it is for and not where quality is decided.
+    """
+    assert CrawlSettings().min_image_bytes <= 2_000

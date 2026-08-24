@@ -9,6 +9,7 @@ No network. respx serves the site; the frontiers are real SQLite files in tmp.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -438,3 +439,72 @@ def test_all_loopback_is_false_when_any_host_is_public():
 def test_all_loopback_is_false_when_nothing_is_enabled():
     """An empty config must not read as 'safe to crawl anonymously'."""
     assert all_loopback(SeedConfig()) is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_budget_skipped_urls_are_released_not_burned(tmp_path):
+    """max_pages is a per-RUN cap, not a verdict on the URLs it stops at.
+
+    The budget check used to call complete(), which marks a URL DONE forever.
+    A 20-page live run against FOSDEM marked 1,347 URLs done having fetched
+    only 20 -- so `--max-pages` silently ate the frontier and a second run the
+    next day would have found nothing left to do.
+    """
+    _site()
+    seeds = _seeds()
+    seeds.verticals[0].max_pages = 1
+
+    async with httpx.AsyncClient() as client:
+        crawler, pages, _, sink = await _build(tmp_path, _cfg(concurrency=1), client, seeds)
+        stats = await crawler.run()
+        sink.close()
+
+    assert stats.pages_fetched == 1
+    st = pages.stats()
+    assert st["pending"] >= 1, "budget-skipped URLs must stay claimable"
+    assert st["inflight"] == 0, "nothing may be left leased"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_budgeted_crawl_resumes_where_it_stopped(tmp_path):
+    """Two budgeted runs over one frontier must together cover the whole site."""
+    _site()
+    seeds_a = _seeds()
+    seeds_a.verticals[0].max_pages = 1
+
+    async with httpx.AsyncClient() as client:
+        crawler, pages, images, sink = await _build(tmp_path, _cfg(concurrency=1), client, seeds_a)
+        first = await crawler.run()
+        sink.close()
+        pages.close()
+        images.close()
+
+    async with httpx.AsyncClient() as client:
+        crawler2, pages2, _, sink2 = await _build(tmp_path, _cfg(concurrency=1), client, _seeds())
+        second = await crawler2.run()
+        sink2.close()
+
+    assert first.pages_fetched == 1
+    assert second.pages_fetched == 2, "the deferred pages must be picked up"
+    assert pages2.stats()["pending"] == 0
+    # Between them the two runs saw the whole site exactly once.
+    assert first.images_fetched + second.images_fetched == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_budgeted_run_still_terminates(tmp_path):
+    """Released URLs keep the page queue non-empty, so quiescence cannot be
+    'pending == 0' alone or the loop spins forever."""
+    _site()
+    seeds = _seeds()
+    seeds.verticals[0].max_pages = 1
+
+    async with httpx.AsyncClient() as client:
+        crawler, _, _, sink = await _build(tmp_path, _cfg(concurrency=4), client, seeds)
+        stats = await asyncio.wait_for(crawler.run(), timeout=20)
+        sink.close()
+
+    assert stats.pages_fetched == 1

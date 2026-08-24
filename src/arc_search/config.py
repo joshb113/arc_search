@@ -64,10 +64,31 @@ class CrawlSettings(BaseSettings):
     backoff_base_s: float = 1.0
     backoff_max_s: float = 60.0
 
-    # Pre-download filtering, applied to HEAD/Content-Length before fetching bytes.
-    min_image_bytes: int = 8_000  # kills tracking pixels and spacers
+    # ---- Pre-index image filtering -----------------------------------------
+    # MEASURED, not chosen. Both of these were magic numbers, and both of them
+    # threw away the entire corpus. Sampled 9 FOSDEM 2025 speaker photos on
+    # 2026-08-24 (vault/research/seed-vertical-conference-speakers.md):
+    #
+    #   dimensions  165x180 .. 180x180   -> min_image_dim=200 rejected 9 of 9
+    #   byte size   5,399 .. 66,114 B    -> min_image_bytes=8000 rejected 4 of 9
+    #
+    # A 180x180 portrait is a perfectly good face image. The old 200 came from
+    # nowhere and would have produced an empty index with no error anywhere.
+
+    # DERIVED from FaceSettings.min_face_px, not picked. An image whose shorter
+    # side is smaller than the smallest face we would accept cannot contain a
+    # qualifying face -- that is the entire justification, and it is why these
+    # two must move together. test_config.py pins the relationship.
+    min_image_dim: int = 64
+
+    # A BANDWIDTH heuristic, not a quality gate. Its only job is to avoid
+    # paying for tracking pixels and spacer GIFs, which are well under 1 KB.
+    # Quality is decided by min_image_dim above and by the FaceSettings gate
+    # after detection. Do not raise this to filter for "good" images; that is
+    # what put 5 KB portraits in the bin.
+    min_image_bytes: int = 2_000
+
     max_image_bytes: int = 20_000_000
-    min_image_dim: int = 200
 
     frontier_backend: str = "sqlite"  # "sqlite" | "redis"
     frontier_path: Path = Path("data/frontier.sqlite")

@@ -72,23 +72,35 @@ def test_image_dimensions_survives_a_truncated_jpeg():
 # --- integration -----------------------------------------------------------
 
 
+def _wipe(conn) -> None:
+    """CASCADE from image_source down; face and eval_pair follow image."""
+    conn.execute(
+        "TRUNCATE image_source, image, page, text_blob, url_path, domain RESTART IDENTITY CASCADE"
+    )
+
+
 @pytest.fixture
 def writer():
+    """A PostgresWriter over an empty database.
+
+    Wipes BEFORE as well as after. Cleaning up only on teardown makes every
+    test in the file depend on nothing else having touched the database first
+    -- which broke the moment a real crawl was run against it by hand, since
+    PostgresWriter seeds its dedup state from `image` at construction. A test
+    that needs an empty database has to make one, not hope for one.
+    """
     import psycopg
 
     from arc_search.index.store import PostgresWriter
 
+    scratch = psycopg.connect(DSN, autocommit=True)
+    _wipe(scratch)
+    scratch.close()
+
     w = PostgresWriter(DSN)
     yield w
-    # Order matters: image_source references both sides.
-    w._conn.execute("DELETE FROM image_source")
-    w._conn.execute("DELETE FROM image")
-    w._conn.execute("DELETE FROM page")
-    w._conn.execute("DELETE FROM text_blob")
-    w._conn.execute("DELETE FROM url_path")
-    w._conn.execute("DELETE FROM domain")
+    _wipe(w._conn)
     w.close()
-    assert psycopg  # imported for the skip check
 
 
 def _ctx(page_url="https://conf.test/speaker/ada/", alt="Photo of Ada"):
@@ -159,7 +171,9 @@ def test_records_an_image_with_provenance(writer):
     assert row[1] == "/speaker/ada/"
     assert row[2] == "Photo of Ada"  # the weak label survives the round trip
     assert (row[3], row[4]) == (400, 400)
-    assert row[6] == 0  # schema default; -1 lives only in the in-memory deduper
+    # -1, NOT 0. The crawl tier has no detector, so "never examined" is the
+    # only honest value. 0 means "examined, found nothing" and is a tombstone.
+    assert row[6] == -1
 
 
 @pytest.mark.integration
@@ -202,6 +216,60 @@ def test_resume_seeds_dedup_from_the_table(writer):
         assert second._conn.execute("SELECT count(*) FROM image").fetchone()[0] == 1
     finally:
         second.close()
+
+
+@pytest.mark.integration
+@needs_pg
+def test_resume_does_not_mark_unexamined_images_barren(writer):
+    """The bug this suite caught on its first run against a real database.
+
+    Deduper treats face_count == 0 as BARREN -- "known to contain no qualifying
+    face, never look again". image.face_count defaulted to 0, and the crawl
+    tier runs with no detector, so every row it wrote claimed to have been
+    examined and found empty. On the next startup the whole corpus loaded as
+    barren and week 2 would have skipped all of it: no faces indexed, no error
+    anywhere, and a failure that reads like a bad model.
+
+    The verdict must be EXACT_DUP (seen before, still needs a detector), never
+    BARREN (seen before, already ruled out).
+    """
+    from arc_search.index.dedup import Verdict
+    from arc_search.index.store import PostgresWriter
+
+    body = _png(400, 400)
+    writer.handle(_img(body), _ctx())
+    assert writer._conn.execute("SELECT face_count FROM image").fetchone()[0] == -1
+
+    fresh = PostgresWriter(DSN)
+    try:
+        result = fresh.dedup.check_bytes(body)
+        assert result is not None
+        assert result.verdict == Verdict.EXACT_DUP
+        assert result.verdict != Verdict.BARREN
+    finally:
+        fresh.close()
+
+
+@pytest.mark.integration
+@needs_pg
+def test_a_genuinely_barren_image_is_still_recorded_as_barren(writer):
+    """The tri-state has to work in both directions, or the -1 fix just breaks
+    the optimization it was protecting. 0 must still mean 'do not re-examine'."""
+    from arc_search.index.dedup import Verdict
+    from arc_search.index.store import PostgresWriter
+
+    body = _png(400, 400)
+    writer.handle(_img(body), _ctx())
+    # Simulate week 2 having examined it and found no qualifying face.
+    writer._conn.execute("UPDATE image SET face_count = 0")
+
+    fresh = PostgresWriter(DSN)
+    try:
+        result = fresh.dedup.check_bytes(body)
+        assert result is not None
+        assert result.verdict == Verdict.BARREN
+    finally:
+        fresh.close()
 
 
 @pytest.mark.integration
