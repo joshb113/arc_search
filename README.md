@@ -32,7 +32,8 @@ The defining constraint. At 30M crawled images / ~10M canonical faces:
 | Qdrant HNSW graph (m=16) | 0.7 GB |
 | Metadata, Postgres (string-interned) | 1.5 GB |
 | PDQ + SHA1 hashes | 1 GB |
-| **Total** | **≈ 48 GB** |
+| Image URLs, inline (`ADR-003`) | 1.6 GB |
+| **Total** | **≈ 49.6 GB** |
 
 Storing full-scene thumbnails instead would cost ~1.2 TB. That difference is the
 core architectural decision — see `vault/decisions/ADR-001-crop-only-storage.md`.

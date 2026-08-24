@@ -428,3 +428,82 @@ def test_interning_caches_survive_a_reconnect(writer):
     assert writer.reconnects == 1
     assert d2 != d1
     assert writer._exec("SELECT count(*) FROM domain").fetchone()[0] == 2
+
+
+# --- image URL (ADR-003) ---------------------------------------------------
+
+
+@pytest.mark.integration
+@needs_pg
+def test_the_image_url_is_stored_so_it_can_be_refetched(writer):
+    """ADR-001 argues crops are enough because a better model can re-derive
+    from the original. That only holds if the original is still reachable."""
+    writer.handle(_img(_png(400, 400)), _ctx())
+    row = writer._exec("""
+        SELECT d.host, i.url_path FROM image i JOIN domain d ON d.id = i.domain_id
+    """).fetchone()
+    assert row == ("conf.test", "/i/ada.png")
+
+
+@pytest.mark.integration
+@needs_pg
+def test_the_image_host_is_its_own_not_the_pages(writer):
+    """Images routinely live on a different host from the page linking them --
+    static.media.ccc.de serves every thumbnail shown on media.ccc.de. Recording
+    the page's host would make the stored URL unfetchable."""
+    from arc_search.crawler.fetch import Fetched
+
+    cdn = Fetched(
+        url="https://static.cdn.test/i/x.png",
+        final_url="https://static.cdn.test/i/x.png",
+        status=200,
+        content_type="image/png",
+        kind="image",
+        body=_png(400, 400),
+        width=400,
+        height=400,
+    )
+    writer.handle(cdn, _ctx(page_url="https://conf.test/speaker/ada/"))
+    host, path = writer._exec(
+        "SELECT d.host, i.url_path FROM image i JOIN domain d ON d.id=i.domain_id"
+    ).fetchone()
+    assert host == "static.cdn.test", "the image's host, not the page's"
+    assert path == "/i/x.png"
+    # ...and the page's host is still recorded separately, on `page`.
+    assert writer._exec("SELECT count(*) FROM domain WHERE host='conf.test'").fetchone()[0] == 1
+
+
+@pytest.mark.integration
+@needs_pg
+def test_the_redirect_target_is_stored_not_the_requested_url(writer):
+    """After a redirect, the re-fetchable URL is the one we ended up at."""
+    from arc_search.crawler.fetch import Fetched
+
+    redirected = Fetched(
+        url="https://conf.test/i/old.png",
+        final_url="https://conf.test/i/new.png",
+        status=200,
+        content_type="image/png",
+        kind="image",
+        body=_png(400, 400),
+        width=400,
+        height=400,
+    )
+    writer.handle(redirected, _ctx())
+    assert writer._exec("SELECT url_path FROM image").fetchone()[0] == "/i/new.png"
+
+
+@pytest.mark.integration
+@needs_pg
+def test_the_url_columns_are_not_nullable(writer):
+    """A nullable column would mean every future reader has to know that NULL
+    means 'crawled before ADR-003'. The invariant is worth more than the hour
+    of recrawl it cost."""
+    import psycopg
+
+    with pytest.raises(psycopg.Error):
+        writer._exec(
+            "INSERT INTO image (sha1, width, height, byte_size, domain_id, url_path) "
+            "VALUES (%s, 1, 1, 1, NULL, NULL)",
+            (b"\x00" * 20,),
+        )

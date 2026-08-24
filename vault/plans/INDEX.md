@@ -68,11 +68,17 @@ This is already a working product.
 
 ## Open questions
 
-- **The image URL is never stored.** `image` has sha1, dimensions and byte size
-  but no URL, so an image cannot be re-fetched and provenance stops at the
-  page. Storing it costs roughly one `url_path` row per image — order 1 GB at
-  10M against a 48 GB budget — so it needs an ADR, not a schema edit.
-  See [[seed-vertical-conference-speakers]].
+- ~~The image URL is never stored.~~ **RESOLVED — [[ADR-003-store-image-urls]].**
+  `image.domain_id` (interned) + `image.url_path` (inline), both NOT NULL.
+  Measured rather than assumed: interning the path costs 295 B/image against
+  157 B inline, 88% more for zero dedup, because image paths are unique per
+  image. Budget 48 → 49.6 GB.
+
+- **`url_path` interns something that never repeats either.** It is 1:1 with
+  `page`, so it pays a row and a UNIQUE index per page for no deduplication —
+  the same reasoning that sent image paths inline in ADR-003. Not urgent, but
+  the same measurement should be run against it before the corpus is large
+  enough to make the migration painful.
 
 - ~~The crawl loop uses ~46% of its permitted request rate.~~ **RESOLVED — it
   was not a bug.** `configured_rate()` returns `min(global, override)`, so
@@ -110,6 +116,7 @@ This is already a working product.
 
 - [[ADR-001-crop-only-storage]]
 - [[ADR-002-greenfield-not-fork]]
+- [[ADR-003-store-image-urls]]
 
 ## Research
 

@@ -51,5 +51,5 @@ vault/       research, ADRs, plans
 
 ## Scale target
 
-30M crawled images → ~10M canonical faces → **~48 GB total on disk.**
+30M crawled images → ~10M canonical faces → **~49.6 GB total on disk.**
 Single machine. One GPU. If a design choice pushes past that, it needs an ADR.

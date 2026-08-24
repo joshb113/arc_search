@@ -54,6 +54,24 @@ CREATE TABLE IF NOT EXISTS image (
     height     INTEGER NOT NULL,
     byte_size  INTEGER NOT NULL,
 
+    -- Where the file lives, so it can be re-fetched. See ADR-003.
+    --
+    -- The host is INTERNED and the path is INLINE, which breaks the pattern
+    -- used elsewhere in this file on purpose: interning exists to collapse
+    -- values that repeat, and image paths are effectively unique per image.
+    -- Measured on 100k realistic paths, interning the path cost 295 B/image
+    -- against 157 B/image inline -- 88% more, for zero deduplication.
+    --
+    -- domain_id comes from the IMAGE's URL, not the page's. Images routinely
+    -- live on another host: static.media.ccc.de serves every thumbnail that
+    -- appears on media.ccc.de.
+    --
+    -- No index. Dedup goes through sha1, provenance through image_source, and
+    -- corpus analysis is an occasional scan; a btree here would roughly double
+    -- the column's cost for no query that currently exists.
+    domain_id  BIGINT NOT NULL REFERENCES domain(id),
+    url_path   TEXT NOT NULL,
+
     -- Tri-state, and the distinction is load-bearing:
     --   -1  never examined by a detector   (the crawl tier writes this)
     --    0  examined, no qualifying face   => barren, skip on recrawl

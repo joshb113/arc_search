@@ -251,14 +251,28 @@ class PostgresWriter:
         # on a default to carry a semantic this important is how they came to
         # disagree in the first place: -1 was passed to Deduper.register() but
         # never to the INSERT, so a resumed crawl read every row back as barren.
+        # The image's OWN host, not the page's -- images routinely live
+        # elsewhere (static.media.ccc.de serves media.ccc.de's thumbnails).
+        # final_url, not url: after a redirect, the URL you can re-fetch is the
+        # one you ended up at. ADR-003.
+        img_host = (urlsplit(fetched.final_url).hostname or "").lower()
         row = self._exec(
             """
-            INSERT INTO image (sha1, width, height, byte_size, face_count)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO image (sha1, width, height, byte_size, face_count,
+                               domain_id, url_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (sha1) DO NOTHING
             RETURNING id
             """,
-            (digest, fetched.width, fetched.height, len(fetched.body), UNEXAMINED),
+            (
+                digest,
+                fetched.width,
+                fetched.height,
+                len(fetched.body),
+                UNEXAMINED,
+                self.domain_id(img_host),
+                path_of(fetched.final_url),
+            ),
         ).fetchone()
 
         if row is None:
