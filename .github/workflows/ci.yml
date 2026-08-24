@@ -15,6 +15,12 @@
 # tests that need an actual server are marked `integration` and skipped unless
 # ARC_TEST_PG_DSN is set. pillow is used to generate real image fixtures and to
 # read image headers in the fetch path.
+#
+# pdqhash matters more than it looks. Without it, index/dedup.py falls back to a
+# 64-bit dHash -- so CI was exercising a hash the shipped code never uses, under
+# a near_dup_threshold of 31 that is calibrated for PDQ's 256 bits and is
+# meaningless against 64. The BK-tree tests passed either way because they are
+# structural, which is exactly why the divergence went unnoticed.
 
 name: ci
 
@@ -38,7 +44,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest pytest-cov pytest-asyncio respx ruff \
-                      numpy selectolax structlog pillow \
+                      numpy selectolax structlog pillow pdqhash \
                       httpx protego pyyaml pydantic-settings \
                       "psycopg[binary]"
 
