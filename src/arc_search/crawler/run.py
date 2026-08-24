@@ -304,6 +304,17 @@ class Crawler:
             self._pages.release(url)
             return
 
+        # Re-check scope on the way OUT of the queue, not only on the way in.
+        # The frontier outlives the config: a URL queued last night under a
+        # looser scope is still sitting there this morning, and enqueue-time
+        # checking alone means tightening seeds.yaml has no effect on anything
+        # already discovered. Tightening scope has to be able to take effect.
+        in_scope, why = self._seeds.in_scope(url, vertical)
+        if not in_scope:
+            self.stats.note_skip(f"dequeue_{why}")
+            self._pages.complete(url)
+            return
+
         try:
             page = await self._fetch.get_page(url)
         except Skipped as s:

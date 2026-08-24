@@ -55,6 +55,16 @@ class Vertical:
     seeds: list[str]
     enabled: bool = False
     allow_hosts: list[str] = field(default_factory=list)
+    # Subtrees to carve back OUT of allow_hosts. Suffix-matched, same as
+    # allow_hosts, and checked after it.
+    #
+    # allow_hosts is a subtree allowlist, so `fosdem.org` also admits
+    # video.fosdem.org and lists.fosdem.org -- a mailing-list archive with tens
+    # of thousands of pages and no faces in any of them, which would quietly
+    # consume the entire crawl budget. Without this the only workaround was a
+    # regex over the full URL, which is both harder to read and easy to get
+    # subtly wrong.
+    deny_hosts: list[str] = field(default_factory=list)
     deny_patterns: list[str] = field(default_factory=list)
     max_depth: int = 6
     max_pages: int = 50_000
@@ -72,6 +82,8 @@ class Vertical:
             self.allow_hosts = sorted(h for h in derived if h)
 
     def host_allowed(self, host: str) -> bool:
+        if any(host_matches(host, entry) for entry in self.deny_hosts):
+            return False
         return any(host_matches(host, entry) for entry in self.allow_hosts)
 
     def denied_by_pattern(self, url: str) -> str | None:
@@ -136,6 +148,7 @@ def _coerce(raw: dict[str, Any]) -> Vertical:
         "seeds",
         "enabled",
         "allow_hosts",
+        "deny_hosts",
         "deny_patterns",
         "max_depth",
         "max_pages",

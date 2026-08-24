@@ -175,3 +175,82 @@ def test_shipped_example_config_loads():
     assert cfg.verticals
     assert cfg.active == []  # the example ships with everything disabled
     assert "facebook.com" in cfg.global_deny_hosts
+
+
+# --- deny_hosts ------------------------------------------------------------
+
+
+def test_deny_hosts_carves_a_subtree_out_of_allow_hosts():
+    """allow_hosts matches subtrees, which admits far more than intended.
+
+    Observed live: `allow_hosts: [fosdem.org]` queued video.fosdem.org,
+    lists.fosdem.org and ksp.fosdem.org. A mailing-list archive is tens of
+    thousands of crawlable pages with no faces in any of them -- enough to
+    consume a whole crawl budget and produce nothing.
+    """
+    v = Vertical(
+        name="v",
+        seeds=["https://example.com/"],
+        allow_hosts=["example.com"],
+        deny_hosts=["lists.example.com"],
+    )
+    assert v.host_allowed("example.com")
+    assert v.host_allowed("static.example.com")
+    assert not v.host_allowed("lists.example.com")
+    # ...and the deny is itself a subtree.
+    assert not v.host_allowed("archive.lists.example.com")
+
+
+def test_deny_hosts_reports_off_vertical_at_the_scope_check():
+    cfg = SeedConfig(
+        verticals=[
+            Vertical(
+                name="v",
+                enabled=True,
+                seeds=["https://example.com/"],
+                allow_hosts=["example.com"],
+                deny_hosts=["lists.example.com"],
+            )
+        ]
+    )
+    v = cfg.verticals[0]
+    assert cfg.in_scope("https://example.com/a", v) == (True, "ok")
+    assert cfg.in_scope("https://lists.example.com/a", v) == (False, "off_vertical")
+
+
+def test_deny_hosts_is_a_recognised_key():
+    """Unknown keys are rejected outright, so a new field must be registered."""
+    import textwrap
+    from pathlib import Path
+    from tempfile import mkdtemp
+
+    p = Path(mkdtemp()) / "s.yaml"
+    p.write_text(
+        textwrap.dedent("""
+            verticals:
+              - name: v
+                enabled: true
+                seeds: ['https://example.com/']
+                allow_hosts: [example.com]
+                deny_hosts: [lists.example.com]
+        """),
+        encoding="utf-8",
+    )
+    cfg = load_seeds(p)
+    assert cfg.verticals[0].deny_hosts == ["lists.example.com"]
+
+
+def test_the_real_seeds_file_excludes_the_faceless_subdomains():
+    """Regression on the actual config, not just the model."""
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "seeds.yaml"
+    if not path.exists():
+        import pytest as _pytest
+
+        _pytest.skip("seeds.yaml is gitignored; only present on a configured checkout")
+    cfg = load_seeds(path)
+    fosdem = next(v for v in cfg.verticals if v.name == "fosdem")
+    for host in ("lists.fosdem.org", "video.fosdem.org", "ksp.fosdem.org"):
+        assert not fosdem.host_allowed(host), host
+    assert fosdem.host_allowed("archive.fosdem.org")

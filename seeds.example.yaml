@@ -21,12 +21,24 @@ verticals:
       - https://example.com/gallery/
       - https://example.org/events/
 
-    # Hosts the crawler may follow links into. Anything not matching is dropped
-    # at enqueue time. Leave empty to restrict strictly to the seed hosts.
+    # Hosts the crawler may follow links into. Anything not matching is dropped.
+    # Leave empty to restrict strictly to the seed hosts.
+    #
+    # NOTE: these match SUBTREES. `example.com` also admits www.example.com and
+    # static.example.com, which is usually what you want because image CDNs are
+    # nearly always subdomains -- but it also admits lists.example.com and
+    # anything else the organisation runs. Check what actually lands in the
+    # frontier early in a crawl; carve out the rest with deny_hosts below.
     allow_hosts:
       - example.com
-      - www.example.com
       - example.org
+
+    # Subtrees to remove from allow_hosts. Checked after it, suffix-matched.
+    # This is where mailing-list archives, video hosts, issue trackers and
+    # login-walled apps go -- large, crawlable, and containing no faces.
+    deny_hosts:
+      - lists.example.com
+      - video.example.com
 
     # Regex, matched against the full URL. Applied after allow_hosts.
     deny_patterns:
