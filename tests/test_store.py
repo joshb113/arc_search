@@ -2,18 +2,30 @@
 
 Two tiers. ``path_of`` and the dimension probe are pure and always run. The
 writer itself needs a live database, so those are marked ``integration`` and
-skipped unless ARC_TEST_PG_DSN points at one:
+skipped unless ARC_TEST_PG_DSN points at one.
+
+THESE TESTS TRUNCATE THE DATABASE THEY POINT AT.
+
+That is not negotiable -- the writer seeds its dedup state from ``image`` at
+construction, so a test asserting on counts has to start from a known-empty
+table. What IS negotiable is which database gets truncated, and an earlier
+version of this file cheerfully documented pointing it at ``arc_search``, the
+production corpus. Running the suite during a crawl would have silently
+destroyed hours of work. ``require_test_database`` now refuses anything whose
+database name does not end in ``_test``.
+
+Setup:
 
     docker compose up -d postgres
-    ARC_TEST_PG_DSN=postgresql://arc@127.0.0.1:5432/arc_search pytest -m integration
-
-The integration tests each work in a savepoint-free scratch schema and clean up
-after themselves, so they can run against a database that already has data.
+    docker exec arc_search-postgres-1 createdb -U arc arc_search_test
+    docker exec -i arc_search-postgres-1 psql -U arc -d arc_search_test < sql/schema.sql
+    ARC_TEST_PG_DSN=postgresql://arc@127.0.0.1:5432/arc_search_test pytest -m integration
 """
 
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -22,6 +34,29 @@ from arc_search.index.store import path_of
 
 DSN = os.environ.get("ARC_TEST_PG_DSN")
 needs_pg = pytest.mark.skipif(not DSN, reason="set ARC_TEST_PG_DSN to run")
+
+TEST_DB_SUFFIX = "_test"
+
+
+def require_test_database(dsn: str) -> str:
+    """Return the database name, or raise if it is not clearly a test database.
+
+    A guard, not a convenience. The fixture TRUNCATEs, and the cost of pointing
+    it one character wrong is the whole corpus.
+    """
+    name = urlsplit(dsn).path.lstrip("/")
+    if not name:
+        raise ValueError(f"ARC_TEST_PG_DSN names no database: {dsn!r}")
+    if not name.endswith(TEST_DB_SUFFIX):
+        raise ValueError(
+            f"refusing to run: ARC_TEST_PG_DSN points at {name!r}, which does not end "
+            f"in {TEST_DB_SUFFIX!r}. These tests TRUNCATE every table. Create a "
+            f"throwaway database instead:\n"
+            f"  docker exec arc_search-postgres-1 createdb -U arc {name}{TEST_DB_SUFFIX}\n"
+            f"  docker exec -i arc_search-postgres-1 psql -U arc "
+            f"-d {name}{TEST_DB_SUFFIX} < sql/schema.sql"
+        )
+    return name
 
 
 # --- pure ------------------------------------------------------------------
@@ -92,6 +127,8 @@ def writer():
     import psycopg
 
     from arc_search.index.store import PostgresWriter
+
+    require_test_database(DSN)  # never truncate the production corpus
 
     scratch = psycopg.connect(DSN, autocommit=True)
     _wipe(scratch)
@@ -290,3 +327,44 @@ def test_a_page_with_no_images_is_still_recorded(writer):
     writer.record_page("https://conf.test/empty/", "Nothing here", 200)
     assert writer._conn.execute("SELECT count(*) FROM page").fetchone()[0] == 1
     assert writer._conn.execute("SELECT count(*) FROM image").fetchone()[0] == 0
+
+
+# --- the guard itself (pure, always runs) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://arc@127.0.0.1:5432/arc_search",  # the production corpus
+        "postgresql://arc@127.0.0.1:5432/postgres",
+        "postgresql://arc@127.0.0.1:5432/arc_search_prod",
+        "postgresql://arc@127.0.0.1:5432/testing",  # 'test' prefix is not a suffix
+        "postgresql://arc@127.0.0.1:5432/",  # no database at all
+    ],
+)
+def test_guard_refuses_databases_that_are_not_clearly_disposable(dsn):
+    """These tests TRUNCATE. Pointing them at the crawl corpus destroys it.
+
+    This is not hypothetical: the fixture wiped the production database
+    mid-session, during a live crawl, because the module docstring told you to
+    set ARC_TEST_PG_DSN to arc_search.
+    """
+    with pytest.raises(ValueError):
+        require_test_database(dsn)
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://arc@127.0.0.1:5432/arc_search_test",
+        "postgresql://arc:pw@db.internal:5432/anything_test",
+    ],
+)
+def test_guard_allows_a_test_database(dsn):
+    assert require_test_database(dsn).endswith("_test")
+
+
+def test_guard_error_names_the_fix():
+    """An error that only says 'no' costs someone twenty minutes."""
+    with pytest.raises(ValueError, match="createdb"):
+        require_test_database("postgresql://arc@127.0.0.1:5432/arc_search")

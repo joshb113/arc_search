@@ -42,6 +42,16 @@ jobs:
                       httpx protego pyyaml pydantic-settings \
                       "psycopg[binary]"
 
+      # Cheap (no downloads) and catches the failure mode the eye_of_web audit
+      # names directly: a dependency added to pyproject but never locked, so a
+      # fresh install resolves differently from the author's machine. Installing
+      # FROM the lock here would drag in onnxruntime-gpu and blow the one-minute
+      # budget; verifying it is current costs milliseconds.
+      - name: Lockfile is current
+        run: |
+          pip install uv
+          uv lock --check
+
       - name: Lint
         run: ruff check src tests
 

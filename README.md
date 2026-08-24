@@ -40,19 +40,57 @@ core architectural decision — see `vault/decisions/ADR-001-crop-only-storage.m
 ## Quickstart
 
 ```bash
-uv sync                          # or: pip install -e ".[dev]"
-docker compose up -d             # qdrant + postgres + redis
-psql -f sql/schema.sql           # create tables
-cp seeds.example.yaml seeds.yaml # then edit: add your target domains
-python -m arc_search.crawler     # start crawling
-python -m arc_search.serve       # http://127.0.0.1:8000
+uv sync                              # or: pip install -e ".[dev]"
+cp .env.example .env                 # then edit it -- see below, two values are required
+docker compose up -d postgres        # schema.sql is applied automatically on first start
+cp seeds.example.yaml seeds.yaml     # then edit: add your target domains
+export PGPASSWORD="$ARC_PG_PASSWORD" # the DSN deliberately carries no password
+python -m arc_search.crawler.run --only <vertical> --max-pages 50
 ```
+
+Two values in `.env` are not optional:
+
+- **`ARC_CRAWL_USER_AGENT`** — the crawler refuses to start on the placeholder.
+  It must name the project and carry a contact route; a repo URL alone is
+  enough, no email required. See "Legal posture" below.
+- **`ARC_PG_PASSWORD`** — `docker compose` refuses to start without it.
+
+Start small. `--max-pages` is a per-run cap and unfetched URLs stay queued, so
+you can crawl in sessions and resume. Drop `--max-pages` when you're satisfied
+the scope config is right.
 
 ## Status
 
-Scaffold. Nothing is load-bearing yet. The week-1 milestone is a crawl of ~10
-seed domains to 100k images with no ML at all — prove extraction and storage
-before adding a GPU to the loop.
+**Week 1: the crawl tier works and is tested.** Frontier, extraction, scope,
+politeness, dedup, and the Postgres writer are all exercised by 181 tests in
+CI, including a crawl loop run against mocked HTTP and a writer run against a
+real database.
+
+Verified against a live corpus: two budgeted runs over one frontier produced 65
+pages and 40 images with zero duplicates, surviving restart.
+
+Not written yet: `index/store.py`'s face half, `serve/`, `eval/calibrate.py`.
+`python -m arc_search.serve` does not exist — week 2. Every similarity
+threshold in `config.py` is marked UNCALIBRATED and is a placeholder until
+`eval.calibrate` has been run against a labeled set.
+
+## Development
+
+```bash
+pytest                               # 171 tests; database tests skip
+```
+
+The database tests **truncate every table**, so they refuse to run against
+anything whose database name does not end in `_test`:
+
+```bash
+docker exec arc_search-postgres-1 createdb -U arc arc_search_test
+docker exec -i arc_search-postgres-1 psql -U arc -d arc_search_test < sql/schema.sql
+ARC_TEST_PG_DSN=postgresql://arc@127.0.0.1:5432/arc_search_test pytest
+```
+
+Run bare `pytest`, not `python -m pytest` — the latter prepends the working
+directory to `sys.path` and will hide import errors that CI then catches.
 
 ## Legal posture
 

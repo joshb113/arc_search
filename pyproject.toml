@@ -5,12 +5,15 @@ description = "Self-hosted face search engine over a targeted vertical crawl"
 requires-python = ">=3.11"
 
 # NOTE ON PINNING
-# Lower bounds live here; exact versions live in the committed lockfile.
-# Generate it before the first real run and commit it:
-#     uv lock                  (preferred)
-#     pip-compile pyproject.toml -o requirements.lock
+# Lower bounds live here; exact versions live in the committed uv.lock (94
+# packages). Regenerate with `uv lock` after changing anything below; CI runs
+# `uv lock --check` and fails if the two disagree.
+#
 # eye_of_web shipped every dependency as `>=` with no lock. A fresh install
-# resolved differently than the author's machine, and nothing caught it.
+# resolved differently than the author's machine, and nothing caught it. This
+# is not theoretical here either: `opencv-python-headless>=4.9` currently
+# resolves to 5.0.0.93 -- a major version the code has never been run against.
+# The lock is what makes that a deliberate upgrade instead of a surprise.
 dependencies = [
     # crawl
     "httpx[http2]>=0.27",
