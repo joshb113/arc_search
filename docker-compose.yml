@@ -3,7 +3,13 @@
 
 services:
   qdrant:
-    image: qdrant/qdrant:v1.9.2
+    # Pinned to the SAME minor as qdrant-client in pyproject.toml. Keep them in
+    # step: the two halves drifted to server 1.9.2 / client 1.19 and there was
+    # no working search path at all between them -- `query_points` 404s on a
+    # server older than 1.10, and `search` was deleted from the client after
+    # 1.13. Writes succeeded throughout, so the collection would have filled up
+    # normally and only failed at the first query.
+    image: qdrant/qdrant:v1.19.0
     restart: unless-stopped
     ports:
       - "127.0.0.1:6333:6333"   # http

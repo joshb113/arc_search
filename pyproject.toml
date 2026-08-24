@@ -24,14 +24,34 @@ dependencies = [
 
     # image + face
     "numpy>=1.26,<3",
+    # NOT opencv-python. Both provide `cv2` and installing both shadows one
+    # arbitrarily. insightface DEPENDS on the non-headless build, so a plain
+    # `pip install -e .` pulls it in anyway -- install insightface with
+    # --no-deps, or accept that the full build wins. Measured working combo on
+    # this machine is recorded in vault/00_Brain/CLAUDE.md.
     "opencv-python-headless>=4.9",
     "pillow>=10.2",
-    "insightface>=0.7.3",
-    "onnxruntime-gpu>=1.17",     # CPU-only install is a ~20x throughput loss
+    # 1.0.1 (2026-05) is the first release shipped as a pure-python
+    # `py3-none-any` wheel. 0.7.3 was sdist-only and needed a C toolchain, which
+    # is why it never installed cleanly here; it also has no Python 3.14 wheel
+    # for its build deps. Do not float this floor back down.
+    "insightface>=1.0.1",
+    # The [cuda,cudnn] extras are NOT optional in practice -- they pull the CUDA
+    # runtime as wheels. Without them onnxruntime finds no cublasLt, prints one
+    # line to stderr, and SILENTLY runs every model on CPU. Measured on an
+    # RTX 5070: 49.0 img/s with CUDA vs 4.1 img/s without, i.e. ~12x, which at
+    # the 30M-image scale target is ~7 days against ~85 days.
+    # index/faces.py:register_cuda_runtime() puts those wheels on the Windows
+    # DLL search path, and effective_providers() reports what actually loaded.
+    "onnxruntime-gpu[cuda,cudnn]>=1.29",
     "pdqhash>=0.2.4",            # Meta's 256-bit perceptual hash (ThreatExchange)
 
     # storage
-    "qdrant-client>=1.9",
+    # Keep this minor in step with the qdrant image in docker-compose.yml. A
+    # `>=1.9` floor let the client reach 1.19 against a pinned 1.9.2 server,
+    # which left no working search path in either direction -- see the version
+    # note in src/arc_search/index/vectors.py.
+    "qdrant-client>=1.19,<1.20",
     "psycopg[binary,pool]>=3.1",
 
     # serve

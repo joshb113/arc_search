@@ -24,40 +24,22 @@ Setup:
 
 from __future__ import annotations
 
-import os
-from urllib.parse import urlsplit
-
 import pytest
 
 from arc_search.crawler.fetch import image_dimensions
 from arc_search.index.store import path_of
 
-DSN = os.environ.get("ARC_TEST_PG_DSN")
-needs_pg = pytest.mark.skipif(not DSN, reason="set ARC_TEST_PG_DSN to run")
-
-TEST_DB_SUFFIX = "_test"
-
-
-def require_test_database(dsn: str) -> str:
-    """Return the database name, or raise if it is not clearly a test database.
-
-    A guard, not a convenience. The fixture TRUNCATEs, and the cost of pointing
-    it one character wrong is the whole corpus.
-    """
-    name = urlsplit(dsn).path.lstrip("/")
-    if not name:
-        raise ValueError(f"ARC_TEST_PG_DSN names no database: {dsn!r}")
-    if not name.endswith(TEST_DB_SUFFIX):
-        raise ValueError(
-            f"refusing to run: ARC_TEST_PG_DSN points at {name!r}, which does not end "
-            f"in {TEST_DB_SUFFIX!r}. These tests TRUNCATE every table. Create a "
-            f"throwaway database instead:\n"
-            f"  docker exec arc_search-postgres-1 createdb -U arc {name}{TEST_DB_SUFFIX}\n"
-            f"  docker exec -i arc_search-postgres-1 psql -U arc "
-            f"-d {name}{TEST_DB_SUFFIX} < sql/schema.sql"
-        )
-    return name
-
+# Shared with test_store_faces.py, which covers the face-writer half of the same
+# class. The `writer` fixture itself is in conftest.py so pytest resolves it by
+# name in both modules -- importing a fixture and then shadowing it with a test
+# parameter of the same name is an F811 redefinition.
+from pgfixtures import (
+    DSN,
+    needs_pg,
+    require_test_database,
+)
+from pgfixtures import ctx as _ctx
+from pgfixtures import img as _img
 
 # --- pure ------------------------------------------------------------------
 
@@ -105,68 +87,6 @@ def test_image_dimensions_survives_a_truncated_jpeg():
 
 
 # --- integration -----------------------------------------------------------
-
-
-def _wipe(conn) -> None:
-    """CASCADE from image_source down; face and eval_pair follow image."""
-    conn.execute(
-        "TRUNCATE image_source, image, page, text_blob, url_path, domain RESTART IDENTITY CASCADE"
-    )
-
-
-@pytest.fixture
-def writer():
-    """A PostgresWriter over an empty database.
-
-    Wipes BEFORE as well as after. Cleaning up only on teardown makes every
-    test in the file depend on nothing else having touched the database first
-    -- which broke the moment a real crawl was run against it by hand, since
-    PostgresWriter seeds its dedup state from `image` at construction. A test
-    that needs an empty database has to make one, not hope for one.
-    """
-    import psycopg
-
-    from arc_search.index.store import PostgresWriter
-
-    require_test_database(DSN)  # never truncate the production corpus
-
-    scratch = psycopg.connect(DSN, autocommit=True)
-    _wipe(scratch)
-    scratch.close()
-
-    w = PostgresWriter(DSN)
-    yield w
-    _wipe(w._conn)
-    w.close()
-
-
-def _ctx(page_url="https://conf.test/speaker/ada/", alt="Photo of Ada"):
-    from arc_search.crawler.run import ImageContext
-
-    return ImageContext(
-        page_url=page_url,
-        page_title="Ada",
-        vertical="conf",
-        depth=2,
-        alt=alt,
-        extractor="img-src",
-        width_hint=None,
-    )
-
-
-def _img(body: bytes):
-    from arc_search.crawler.fetch import Fetched
-
-    return Fetched(
-        url="https://conf.test/i/ada.png",
-        final_url="https://conf.test/i/ada.png",
-        status=200,
-        content_type="image/png",
-        kind="image",
-        body=body,
-        width=400,
-        height=400,
-    )
 
 
 @pytest.mark.integration

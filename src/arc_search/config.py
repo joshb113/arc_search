@@ -79,7 +79,10 @@ class CrawlSettings(BaseSettings):
     # side is smaller than the smallest face we would accept cannot contain a
     # qualifying face -- that is the entire justification, and it is why these
     # two must move together. test_config.py pins the relationship.
-    min_image_dim: int = 64
+    #
+    # Moved 64 -> 48 on 2026-08-24 because min_face_px did; see the derivation
+    # there. The invariant, not this literal, is the thing to preserve.
+    min_image_dim: int = 48
 
     # A BANDWIDTH heuristic, not a quality gate. Its only job is to avoid
     # paying for tracking pixels and spacer GIFs, which are well under 1 KB.
@@ -112,7 +115,30 @@ class FaceSettings(BaseSettings):
     # These are the dominant source of false positives at 10M+ scale: a 12x12
     # background face in a crowd shot must not carry the same index weight as a
     # clean portrait.
-    min_face_px: int = 64
+    # DERIVED, 2026-08-24. See vault/research/face-model-bringup.md.
+    #
+    # Measured the embedding's cosine similarity to its OWN full-resolution self
+    # as the face is downscaled, over real FOSDEM speaker photos:
+    #
+    #     96px 0.994 | 72px 0.989 | 64px 0.987 | 56px 0.981
+    #     48px 0.973 (min 0.951)  | 40px 0.953 (min 0.932)
+    #     32px 0.910 (min 0.885)  | 24px 0.815
+    #
+    # The knee is between 40 and 32, where the vector drops below
+    # IndexSettings.canonical_threshold (0.92) -- i.e. where a face stops
+    # matching itself. 48 keeps a real margin above that floor on the WORST
+    # case, not just the mean.
+    #
+    # The old 64 was not derived from anything. It sat on the median face size
+    # of this corpus (68px) and discarded 40% of all detections, which is the
+    # same failure as min_image_dim=200 and min_image_bytes=8000 before it.
+    #
+    # ⚠️ This measures self-consistency under downscaling, NOT discriminability
+    # between different people. The false-positive argument in faces.py is about
+    # discrimination and needs labeled pairs -- so this number is still
+    # provisional and belongs to arc_search.eval.calibrate in the end. What the
+    # measurement establishes is that the MODEL does not require 64.
+    min_face_px: int = 48
     min_det_score: float = 0.72
     min_blur_var: float = 45.0  # cv2.Laplacian variance
     max_abs_yaw: float = 50.0  # degrees

@@ -178,6 +178,17 @@ class Deduper:
             return DedupResult(Verdict.NEAR_DUP, digest, pdq, match)
         return DedupResult(Verdict.NEW, digest, pdq)
 
+    def mark_barren(self, sha1: bytes) -> None:
+        """Record that this image was examined and held no qualifying face.
+
+        Keyed by sha1, like the rest of the barren set -- the index tier learns
+        an image is barren by image_id, so the caller has to resolve it back to
+        the digest. Without this, a long-lived process that both crawls and
+        indexes keeps re-examining images it already rejected, because the
+        in-memory dedup state only learns about barrenness at startup.
+        """
+        self._barren.add(sha1)
+
     def register(self, sha1: bytes, pdq: np.ndarray | None, image_id: int, face_count: int) -> None:
         self._sha1[sha1] = image_id
         if face_count == 0:

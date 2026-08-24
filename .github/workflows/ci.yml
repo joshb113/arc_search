@@ -21,6 +21,14 @@
 # a near_dup_threshold of 31 that is calibrated for PDQ's 256 bits and is
 # meaningless against 64. The BK-tree tests passed either way because they are
 # structural, which is exactly why the divergence went unnoticed.
+#
+# qdrant-client is here for the same reason as psycopg: tests/test_vectors.py
+# imports index/vectors.py for its pure validation tests, and a missing client
+# would be a COLLECTION error rather than a skip -- the whole file would vanish
+# from the run and the suite would still report green. The tests that need a
+# live server are marked `integration` and skip themselves when 6333 is closed.
+# Its version floor is pinned in step with the qdrant image in
+# docker-compose.yml; see the note in src/arc_search/index/vectors.py.
 
 name: ci
 
@@ -46,7 +54,7 @@ jobs:
           pip install pytest pytest-cov pytest-asyncio respx ruff \
                       numpy selectolax structlog pillow pdqhash \
                       httpx protego pyyaml pydantic-settings \
-                      "psycopg[binary]"
+                      "psycopg[binary]" "qdrant-client>=1.19,<1.20"
 
       # Cheap (no downloads) and catches the failure mode the eye_of_web audit
       # names directly: a dependency added to pyproject but never locked, so a

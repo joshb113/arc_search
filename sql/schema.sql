@@ -72,9 +72,10 @@ CREATE TABLE IF NOT EXISTS image (
     domain_id  BIGINT NOT NULL REFERENCES domain(id),
     url_path   TEXT NOT NULL,
 
-    -- Tri-state, and the distinction is load-bearing:
+    -- Four-state, and every distinction is load-bearing:
+    --   -2  examined under an UNCALIBRATED gate, nothing qualified => re-examine
     --   -1  never examined by a detector   (the crawl tier writes this)
-    --    0  examined, no qualifying face   => barren, skip on recrawl
+    --    0  examined, no qualifying face   => barren, skip forever
     --   >0  this many faces indexed
     --
     -- This defaulted to 0 and that was a bug. The crawl tier runs with no model
@@ -83,13 +84,30 @@ CREATE TABLE IF NOT EXISTS image (
     -- skipped the entire corpus -- a silent, total loss of face extraction that
     -- would have presented as a model failure. Caught by
     -- test_resume_does_not_mark_unexamined_images_barren.
+    --
+    -- -2 was added for the mirror-image risk. 0 is a TOMBSTONE: Deduper reads it
+    -- as never-look-again, permanently. But every gate that produces "no
+    -- qualifying face" -- min_face_px, min_det_score, min_blur_var, max_abs_yaw
+    -- -- is still UNCALIBRATED (non-negotiable #5), so a 0 written today encodes
+    -- a number nobody has justified yet, irreversibly. min_face_px alone was
+    -- measured discarding 40% of real detections while set to 64.
+    --
+    -- So: while search.calibrated is False, an empty result is -2, not 0. It
+    -- stays re-examinable at the cost of one re-fetch. Once calibration has run,
+    -- 0 becomes honest and the -2 rows get one more pass.
     face_count SMALLINT NOT NULL DEFAULT -1,
-    CONSTRAINT face_count_valid CHECK (face_count >= -1),
+    CONSTRAINT face_count_valid CHECK (face_count >= -2),
 
     first_seen TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- Work queue for the indexing pass: everything the detector has not seen.
-CREATE INDEX IF NOT EXISTS image_unexamined_idx ON image (id) WHERE face_count < 0;
+-- Work queue for the indexing pass: images no detector has ever seen.
+-- Deliberately `= -1`, not `< 0`: -2 means "already examined, awaiting
+-- calibration", and including it would make every backfill run re-fetch and
+-- re-detect the whole provisional set forever.
+CREATE INDEX IF NOT EXISTS image_unexamined_idx ON image (id) WHERE face_count = -1;
+-- The recheck queue: everything gated out under uncalibrated thresholds. Drain
+-- this after arc_search.eval.calibrate has run.
+CREATE INDEX IF NOT EXISTS image_provisional_idx ON image (id) WHERE face_count = -2;
 -- PDQ near-duplicate lookup is done in the app via a BK-tree seeded from this
 -- column; the btree here is only for the exact-PDQ fast path.
 CREATE INDEX IF NOT EXISTS image_pdq_idx ON image (pdq) WHERE pdq IS NOT NULL;

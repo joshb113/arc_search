@@ -36,6 +36,9 @@ not the constraint at 1 rps.
 from __future__ import annotations
 
 import hashlib
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -55,6 +58,60 @@ log = structlog.get_logger(__name__)
 # as "examined and barren" and will skip the image forever. See the column
 # comment in sql/schema.sql.
 UNEXAMINED = -1
+
+# Examined, nothing qualified, but under thresholds nobody has calibrated yet.
+# Distinct from 0 because 0 is a TOMBSTONE -- Deduper reads it as never-look-
+# again, permanently -- and every gate that can produce an empty result
+# (min_face_px, min_det_score, min_blur_var, max_abs_yaw) is still an
+# UNCALIBRATED placeholder. min_face_px alone was measured discarding 40% of
+# real detections at its old value. Writing 0 now would make today's unjustified
+# numbers irreversible; -2 costs one re-fetch later and keeps the option open.
+PROVISIONAL_EMPTY = -2
+
+# Scheme is not a stored column -- `image` keeps an interned host plus an inline
+# path, and nothing else (ADR-003). Re-fetching therefore has to assume one, and
+# https is the assumption: an http-only host redirects, while guessing http at an
+# https-only host is a hard failure. Revisit if a vertical ever serves images
+# from a host that does neither.
+REFETCH_SCHEME = "https"
+
+
+@dataclass(frozen=True)
+class FaceRecord:
+    """One detected face, shaped for the `face` table.
+
+    Not ``faces.Face``: that carries the decoded crop array and pulls in cv2 and
+    insightface. The writer takes a path, not pixels -- nothing in this module
+    should need a detector importable to run.
+
+    Geometry is at ORIGINAL image resolution and ``src_width``/``src_height``
+    say which resolution that was. Non-negotiable #3. Do not pre-scale these to
+    match the 128px crop; that is the eye_of_web mistake this project exists in
+    reaction to, and it is unrecoverable after the fact because the scale factor
+    is not stored anywhere.
+    """
+
+    qdrant_id: uuid.UUID
+    bbox: tuple[float, float, float, float]
+    landmarks: Sequence[float]  # flattened [x,y] * 5, ORIGINAL resolution
+    src_width: int
+    src_height: int
+    det_score: float
+    blur_var: float
+    yaw: float | None
+    quality: float
+    age_est: int | None
+    crop_path: str | None
+
+
+@dataclass(frozen=True)
+class UnexaminedImage:
+    """A row from the indexing work queue, with enough to re-fetch the bytes."""
+
+    image_id: int
+    url: str
+    width: int
+    height: int
 
 
 def path_of(url: str) -> str:
@@ -304,11 +361,209 @@ class PostgresWriter:
             (image_id, page_id, self.text_id(context.alt)),
         )
 
+    # -- faces -------------------------------------------------------------
+
+    def unexamined_images(self, limit: int = 1000, after_id: int = 0) -> list[UnexaminedImage]:
+        """The indexing work queue: images no detector has looked at.
+
+        Backed by ``image_unexamined_idx``, a partial index on
+        ``face_count = -1`` that exists for exactly this query. Keyset paginated
+        on ``id`` rather than OFFSET, because rows leave the queue as they are
+        processed -- an OFFSET walk over a shrinking result set skips work
+        silently, which is the worst possible failure for a backfill.
+
+        ``= -1``, not ``< 0``. -2 means "examined, awaiting calibration"; folding
+        it in here would make every run re-fetch and re-detect the entire
+        provisional set forever. Use ``provisional_images()`` to drain that.
+        """
+        rows = self._exec(
+            """
+            SELECT i.id, d.host, i.url_path, i.width, i.height
+            FROM image i
+            JOIN domain d ON d.id = i.domain_id
+            WHERE i.face_count = %s AND i.id > %s
+            ORDER BY i.id
+            LIMIT %s
+            """,
+            (UNEXAMINED, after_id, limit),
+        ).fetchall()
+        return [
+            UnexaminedImage(
+                image_id=r[0],
+                url=f"{REFETCH_SCHEME}://{r[1]}{r[2]}",
+                width=r[3],
+                height=r[4],
+            )
+            for r in rows
+        ]
+
+    def unexamined_count(self) -> int:
+        row = self._exec("SELECT count(*) FROM image WHERE face_count = %s", (UNEXAMINED,))
+        r = row.fetchone()
+        return r[0] if r else 0
+
+    def provisional_images(self, limit: int = 1000, after_id: int = 0) -> list[UnexaminedImage]:
+        """The recheck queue: gated out under thresholds nobody has calibrated.
+
+        Drain this after ``arc_search.eval.calibrate`` has run and the gate has
+        moved. Same shape and same keyset rule as ``unexamined_images``.
+        """
+        rows = self._exec(
+            """
+            SELECT i.id, d.host, i.url_path, i.width, i.height
+            FROM image i
+            JOIN domain d ON d.id = i.domain_id
+            WHERE i.face_count = %s AND i.id > %s
+            ORDER BY i.id
+            LIMIT %s
+            """,
+            (PROVISIONAL_EMPTY, after_id, limit),
+        ).fetchall()
+        return [
+            UnexaminedImage(
+                image_id=r[0],
+                url=f"{REFETCH_SCHEME}://{r[1]}{r[2]}",
+                width=r[3],
+                height=r[4],
+            )
+            for r in rows
+        ]
+
+    def provisional_count(self) -> int:
+        row = self._exec(
+            "SELECT count(*) FROM image WHERE face_count = %s", (PROVISIONAL_EMPTY,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def record_faces(self, image_id: int, records: Sequence[FaceRecord]) -> list[int]:
+        """Replace this image's face rows. Returns the new ids, in order.
+
+        Does NOT touch ``face_count`` -- that is deliberately a separate call.
+        ``face_count`` is the commit marker for Postgres *and* Qdrant together,
+        so it must not flip until the vectors are in as well. See the
+        consistency note in ``vectors.py``. The caller's order is:
+
+            record_faces() -> VectorStore.delete_image()/upsert() -> mark_examined()
+
+        DELETE-then-INSERT rather than an upsert because a re-run may find a
+        DIFFERENT number of faces than last time (a better model, a changed
+        threshold). Leaving the surplus behind would strand rows whose vectors
+        were already dropped from Qdrant.
+        """
+        with self._conn.transaction():
+            self._conn.execute("DELETE FROM face WHERE image_id = %s", (image_id,))
+            ids: list[int] = []
+            for rec in records:
+                lm = [float(v) for v in rec.landmarks]
+                if len(lm) != 10:
+                    raise ValueError(
+                        f"image {image_id}: landmarks must be 5 flattened [x,y] pairs, "
+                        f"got {len(lm)}"
+                    )
+                row = self._conn.execute(
+                    """
+                    INSERT INTO face (image_id, qdrant_id, bbox, landmarks,
+                                      src_width, src_height, det_score, blur_var,
+                                      yaw, quality, age_est, crop_path)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        image_id,
+                        str(rec.qdrant_id),
+                        [float(v) for v in rec.bbox],
+                        lm,
+                        rec.src_width,
+                        rec.src_height,
+                        rec.det_score,
+                        rec.blur_var,
+                        rec.yaw,
+                        rec.quality,
+                        rec.age_est,
+                        rec.crop_path,
+                    ),
+                ).fetchone()
+                assert row is not None  # RETURNING on a plain INSERT
+                ids.append(row[0])
+        return ids
+
+    def mark_examined(self, image_id: int, face_count: int, *, calibrated: bool = False) -> None:
+        """Commit the pair of stores for this image.
+
+        Call this LAST, after both the face rows and the vectors have landed.
+        Until it runs the image stays at -1, stays in the work queue, and any
+        partial state in either store is disposable because both are cleared
+        before being rewritten.
+
+        ``calibrated`` decides what an EMPTY result means, and it is the whole
+        point of the flag. ``face_count = 0`` is a tombstone: Deduper reads it as
+        never-look-again, permanently. But every gate that can produce an empty
+        result is still an uncalibrated placeholder (non-negotiable #5), so
+        while ``calibrated`` is False an empty result is recorded as
+        ``PROVISIONAL_EMPTY`` (-2) and stays on the recheck queue instead.
+
+        Pass ``calibrated=settings.search.calibrated``. It defaults to False so
+        that forgetting it costs a re-fetch rather than a silent, permanent loss
+        -- the cheap mistake, not the expensive one.
+
+        A positive count is unaffected: faces that WERE found are real
+        regardless of where the gate sits.
+        """
+        if face_count < 0:
+            raise ValueError(
+                f"mark_examined needs a real count, got {face_count}. "
+                "-1 means unexamined and is written by the crawl tier only; "
+                "-2 is chosen by this method, never passed to it."
+            )
+
+        stored = face_count
+        if face_count == 0 and not calibrated:
+            stored = PROVISIONAL_EMPTY
+            log.debug("store.provisional_empty", image_id=image_id)
+
+        self._exec("UPDATE image SET face_count = %s WHERE id = %s", (stored, image_id))
+
+        # Keep the in-memory dedup state in step, but only where it changes an
+        # answer: `_barren` is what makes check_bytes() say "skip forever", and
+        # it is keyed by sha1, so a barren verdict has to be resolved back to
+        # the digest. Costs one primary-key lookup on the 0-face path only.
+        # A process that crawls and indexes in the same loop would otherwise
+        # keep re-examining images it had already rejected this run.
+        #
+        # Guarded on `stored`, not `face_count`: a PROVISIONAL_EMPTY image is
+        # explicitly NOT barren, and marking it so in memory would defeat the
+        # entire point of keeping it re-examinable.
+        if stored == 0:
+            row = self._exec("SELECT sha1 FROM image WHERE id = %s", (image_id,)).fetchone()
+            if row is not None:
+                self.dedup.mark_barren(bytes(row[0]))
+
+    def face_counts(self) -> dict[str, int]:
+        """Corpus-level indexing progress. Cheap enough to log on a heartbeat."""
+        row = self._exec(
+            """
+            SELECT count(*) FILTER (WHERE face_count = -1),
+                   count(*) FILTER (WHERE face_count = -2),
+                   count(*) FILTER (WHERE face_count = 0),
+                   count(*) FILTER (WHERE face_count > 0),
+                   coalesce(sum(face_count) FILTER (WHERE face_count > 0), 0)
+            FROM image
+            """
+        ).fetchone()
+        assert row is not None
+        return {
+            "unexamined": row[0],
+            "provisional": row[1],  # gated out, awaiting calibration
+            "barren": row[2],  # tombstoned, never re-examined
+            "with_faces": row[3],
+            "faces_total": row[4],
+        }
+
     # -- reporting ---------------------------------------------------------
 
     def counts(self) -> dict[str, int]:
         out = {}
-        for table in ("domain", "page", "image", "image_source", "text_blob"):
+        for table in ("domain", "page", "image", "image_source", "text_blob", "face"):
             row = self._exec(f"SELECT count(*) FROM {table}").fetchone()
             out[table] = row[0] if row else 0
         return out
