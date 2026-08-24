@@ -153,6 +153,53 @@ Two bugs surfaced here that unit tests could not have caught:
    nothing on the second night. Budget-skipped URLs are now `release()`d back
    to PENDING.
 
+## Profiling the throughput "gap", 2026-08-24
+
+The live crawl sustained 0.46–0.50 req/s against a configured 1.0. Chased it
+properly rather than guessing, and the chase is more instructive than the
+answer.
+
+**What was ruled out, by measurement:**
+
+| suspect | verdict |
+|---|---|
+| `TokenBucket` inaccuracy | exact: 1.00/s at 1, 4 and 16 workers; also exact at 0.5 and 2.0 |
+| duplicate images absorbing requests | `image_source` growth accounts for almost none |
+| `_idle()` polling the frontier | 0.52 ms/call, ~5% of one core |
+| `Frontier` / parsing cost | 1 ms and 1.3 ms per speaker page |
+| the `concurrency // 4` worker split | 4.06 req/s at a 4.0 limit with **one** page worker |
+| the sink | internal ceiling 114 req/s (JSONL), 56 req/s (Postgres) |
+
+**The answer:** `configured_rate()` returns `min(global, override)`. The global
+`per_host_rps` default is 0.5 and `seeds.yaml` asked for 1.0, so it was clamped.
+The crawler was doing exactly what it was configured to do. An override may only
+ever *lower* the rate — which is the correct contract for a politeness control,
+and is what `seeds.example.yaml` documents.
+
+The real defect was observability: the startup log printed the *requested*
+override, so it read `1.0` while the crawl ran at `0.5`. It now logs
+`effective_rps` and warns `politeness.override_ignored`. Raising
+`ARC_CRAWL_PER_HOST_RPS` to 1.0 is the correct lever; measured `req_per_s=1.0`
+sustained afterwards, halving the archive run to ~5 h.
+
+**Two things the profiler found on the way**, neither of which was the target:
+
+- **robots.txt was fetched from the wrong port.** The URL was built from the
+  bare hostname, so a host on `:8080` had its robots.txt requested from `:80`.
+  That connection fails, `Politeness` fails closed, and the entire host is
+  silently skipped — reported only as `robots_disallow`, which reads like the
+  site said no. Found within seconds of pointing the profiler at a loopback
+  server on an ephemeral port. State is now keyed per `scheme://authority` per
+  RFC 9309, while the rate budget stays per hostname, because one machine
+  answers all of its ports.
+- **Request counts were never recorded.** Throughput had to be inferred from
+  table growth, which undercounts — a skipped or duplicate image spends a token
+  and writes nothing. `Politeness.requests_made` now counts at the limiter,
+  where every request passes exactly once, and the heartbeat reports
+  `req_per_s`. That turned a two-hour question into a one-line answer.
+
+The harness is kept at `tools/profile_crawl_loop.py`.
+
 ## Caveats to carry into week 2
 
 - **FOSDEM photos are portraits.** A threshold calibrated on nothing but clean

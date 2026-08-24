@@ -261,6 +261,16 @@ class Fetcher:
         self._sleep = sleep or asyncio.sleep
 
     @property
+    def requests_made(self) -> int:
+        """Exact count of outbound requests, counted at the rate limiter.
+
+        Every request passes ``Politeness.wait`` exactly once. Database row
+        counts are NOT a proxy: a skipped or duplicate image spends a token and
+        writes nothing, so inferring throughput from table growth reads low.
+        """
+        return self._pol.requests_made
+
+    @property
     def headers(self) -> dict[str, str]:
         return {
             "User-Agent": self._cfg.user_agent,

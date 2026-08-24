@@ -477,13 +477,25 @@ class Crawler:
         return self.stats
 
     async def _heartbeat(self, every: float = 30.0) -> None:
+        last_req, last_t = 0, time.monotonic()
         while True:
             await asyncio.sleep(every)
+            # Requests, not rows. Rows undercount: a skipped or duplicate
+            # image spends a token and writes nothing, so inferring the
+            # request rate from table growth reads low and sends you
+            # hunting for a bottleneck that is not there.
+            req = self._fetch.requests_made
+            now = time.monotonic()
+            rate = (req - last_req) / max(1e-9, now - last_t)
+            last_req, last_t = req, now
             log.info(
                 "crawl.progress",
                 pages=self.stats.pages_fetched,
                 images=self.stats.images_fetched,
                 discovered=self.stats.images_seen,
+                requests=req,
+                req_per_s=round(rate, 2),
+                skips=sum(self.stats.skips.values()),
                 pending_pages=self._pages.stats()["pending"],
                 pending_images=self._images.stats()["pending"],
             )
@@ -645,7 +657,26 @@ async def main(argv: list[str] | None = None) -> int:
     ) as client:
         host_rps = seeds.host_rate_limits()
         if host_rps:
-            log.info("politeness.host_overrides", hosts=host_rps)
+            # Log what is IN FORCE, not what was asked for. The previous line
+            # logged the requested override, so a seeds.yaml asking for 1.0 rps
+            # printed "1.0" while the crawl actually ran at the 0.5 global --
+            # which sent me profiling a two-fold throughput "gap" that was the
+            # documented contract working correctly.
+            effective = {h: min(r, cfg.per_host_rps) for h, r in host_rps.items()}
+            log.info("politeness.host_rates", effective_rps=effective)
+
+            clamped = {h: r for h, r in host_rps.items() if r > cfg.per_host_rps}
+            if clamped:
+                log.warning(
+                    "politeness.override_ignored",
+                    requested=clamped,
+                    global_rps=cfg.per_host_rps,
+                    hint=(
+                        "per_host_rps may only LOWER the global rate. To crawl "
+                        "faster, raise ARC_CRAWL_PER_HOST_RPS -- and check the "
+                        "host's robots.txt first."
+                    ),
+                )
         fetcher = Fetcher(cfg, client, Politeness(cfg, client, host_rps))
         crawler = Crawler(cfg, seeds, fetcher, pages, images, sink)
 

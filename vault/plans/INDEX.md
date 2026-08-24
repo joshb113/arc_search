@@ -68,24 +68,17 @@ This is already a working product.
 
 ## Open questions
 
-- **The crawl loop uses ~46% of its permitted request rate.** Configured at
-  1.0 rps against `archive.fosdem.org`, sustained throughput is 0.46–0.50
-  requests/sec measured over 180s and 240s windows. Ruled out, by measurement:
-  the `TokenBucket` itself is exact (1.00/s at 1/4/16 concurrent workers, and
-  correct at 0.5 and 2.0 rps once the harness stopped counting grants that
-  landed after the window); duplicate images (`image_source` growth accounts
-  for almost nothing); and `_idle()` polling (~5% of one core).
+- ~~The crawl loop uses ~46% of its permitted request rate.~~ **RESOLVED — it
+  was not a bug.** `configured_rate()` returns `min(global, override)`, so
+  `seeds.yaml` asking for 1.0 rps against the 0.5 global default was clamped to
+  0.5. The crawler was doing exactly what it was told. See
+  [[seed-vertical-conference-speakers]] for the profiling that got there.
 
-  Not yet isolated. The suspects are all "synchronous work on the event loop":
-  `Frontier` is blocking SQLite on one shared connection, `PostgresWriter` is
-  blocking psycopg, and both are called from async workers. A page with 700
-  links does 700 blocking `add()` calls. Also worth checking the fixed
-  `concurrency // 4` page/image worker split — with `pending_images` sitting at
-  0, twelve image workers idle while four page workers do everything.
-
-  Consequence is wall-clock only: ~9.3 h for the archive run instead of ~5 h.
-  Not a politeness or correctness problem — we are under the limit, not over.
-  Profile before scaling to `conf.researchr.org`, where it would matter more.
+  The real defect was that **nothing said so**: the startup log printed the
+  *requested* override, so it read `1.0` while the crawl ran at `0.5`. It now
+  logs `effective_rps` and warns `politeness.override_ignored` when a vertical
+  asks for more than the global allows. `ARC_CRAWL_PER_HOST_RPS=1.0` in `.env`
+  is the correct lever, and the run now sustains a measured `req_per_s=1.0`.
 
 - **Will the vertical reach 100k?** FOSDEM + ccc is likely 30–50k. The make-up
   is `conf.researchr.org`, parked as tier 2 in `seeds.yaml`. Decide after the

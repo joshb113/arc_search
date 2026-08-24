@@ -37,8 +37,14 @@ verticals:
     max_depth: 6
     max_pages: 50000          # hard ceiling per vertical, per run
 
-    # Per-host override of the global politeness setting. Only ever lower this
-    # (i.e. go slower). Sites that publish a Crawl-delay always win.
+    # Per-host override of the global politeness setting. This can only ever
+    # LOWER the rate -- a value above ARC_CRAWL_PER_HOST_RPS (default 0.5) is
+    # clamped to the global and logged as politeness.override_ignored. To crawl
+    # a host faster, raise the global setting deliberately, after reading that
+    # host's robots.txt.
+    #
+    # A published Crawl-delay also only ever slows us further: the effective
+    # rate is the slowest of (global, this override, robots Crawl-delay).
     per_host_rps: 0.5
 
 # Hosts to never touch, regardless of what a seed links to. Social platforms and
