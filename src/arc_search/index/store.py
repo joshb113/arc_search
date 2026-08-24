@@ -71,7 +71,9 @@ class PostgresWriter:
     """Crawl sink backed by Postgres. Implements the ``CrawlSink`` protocol."""
 
     def __init__(self, dsn: str, deduper: Deduper | None = None) -> None:
+        self._dsn = dsn
         self._conn = psycopg.connect(dsn, autocommit=True)
+        self.reconnects = 0
         self.dedup = deduper if deduper is not None else Deduper()
 
         # Interning caches. Unbounded on purpose: a bounded vertical crawl sees
@@ -83,6 +85,50 @@ class PostgresWriter:
         self._pages: dict[str, int] = {}
 
         self.loaded = self._load_dedup()
+
+    # -- connection resilience ---------------------------------------------
+
+    def _healthy(self) -> bool:
+        """Is the connection still usable? Distinguishes the two failure kinds.
+
+        A constraint violation leaves the connection perfectly fine and must be
+        re-raised. A dropped or desynchronised connection must be replaced. The
+        cheapest reliable test is to ask it to do something trivial.
+        """
+        if self._conn.closed:
+            return False
+        try:
+            self._conn.execute("SELECT 1")
+        except psycopg.Error:
+            return False
+        return True
+
+    def _exec(self, sql: str, params: tuple | None = None, *, retry: bool = True):
+        """Execute, replacing the connection once if it has gone bad.
+
+        A five-hour unattended crawl cannot die because the database blinked.
+        This is not hypothetical: an archive run died at startup with
+
+            psycopg.DatabaseError: insufficient data in "D" message
+            lost synchronization with server: got message type "f"
+
+        -- a corrupted wire stream, transient (the same query then succeeded
+        12/12 by hand), and fatal because nothing reconnected. Worse than
+        fatal, actually: without this, a mid-crawl blip would leave every
+        subsequent write failing while the crawler carried on looking busy,
+        fetching pages and storing none of them.
+        """
+        try:
+            return self._conn.execute(sql, params)
+        except psycopg.Error:
+            if not retry or self._healthy():
+                raise  # a real error -- constraint violation, bad SQL
+            log.warning("store.reconnecting", dsn_db=self._dsn.rsplit("/", 1)[-1])
+            self._conn = psycopg.connect(self._dsn, autocommit=True)
+            self.reconnects += 1
+            # Interning caches survive deliberately: the ids they hold are
+            # committed rows, still valid on any connection.
+            return self._exec(sql, params, retry=False)
 
     # -- resume ------------------------------------------------------------
 
@@ -98,9 +144,7 @@ class PostgresWriter:
         which point dedup wants to become a query rather than a preload. That
         is a week-5 problem, not a week-1 one.
         """
-        rows = self._conn.execute(
-            "SELECT id, sha1, pdq, face_count FROM image ORDER BY id"
-        ).fetchall()
+        rows = self._exec("SELECT id, sha1, pdq, face_count FROM image ORDER BY id").fetchall()
         if rows:
             self.dedup.load([(r[0], bytes(r[1]), None, r[3]) for r in rows])
         log.info("store.resumed", images=len(rows))
@@ -121,14 +165,14 @@ class PostgresWriter:
             return hit
 
         sel = f"SELECT id FROM {table} WHERE {conflict} = %s"
-        row = self._conn.execute(sel, (key,)).fetchone()
+        row = self._exec(sel, (key,)).fetchone()
         if row is None:
-            self._conn.execute(
+            self._exec(
                 f"INSERT INTO {table} ({cols}) VALUES ({', '.join(['%s'] * len(values))}) "
                 f"ON CONFLICT DO NOTHING",
                 values,
             )
-            row = self._conn.execute(sel, (key,)).fetchone()
+            row = self._exec(sel, (key,)).fetchone()
             if row is None:  # pragma: no cover - only on a concurrent DELETE
                 raise RuntimeError(f"{table}: row vanished between insert and select")
 
@@ -163,14 +207,14 @@ class PostgresWriter:
         if (hit := self._pages.get(url)) is not None:
             # Already seen this run. Refresh last_seen so the TTL reaper has an
             # accurate picture, but skip the interning round trips.
-            self._conn.execute("UPDATE page SET last_seen = now() WHERE id = %s", (hit,))
+            self._exec("UPDATE page SET last_seen = now() WHERE id = %s", (hit,))
             return hit
 
         host = (urlsplit(url).hostname or "").lower()
         did, pid = self.domain_id(host), self.path_id(path_of(url))
         tid = self.text_id(title)
 
-        row = self._conn.execute(
+        row = self._exec(
             """
             INSERT INTO page (domain_id, url_path_id, title_id, http_status)
             VALUES (%s, %s, %s, %s)
@@ -207,7 +251,7 @@ class PostgresWriter:
         # on a default to carry a semantic this important is how they came to
         # disagree in the first place: -1 was passed to Deduper.register() but
         # never to the INSERT, so a resumed crawl read every row back as barren.
-        row = self._conn.execute(
+        row = self._exec(
             """
             INSERT INTO image (sha1, width, height, byte_size, face_count)
             VALUES (%s, %s, %s, %s, %s)
@@ -220,7 +264,7 @@ class PostgresWriter:
         if row is None:
             # Lost a race, or the row predates this process's dedup snapshot.
             # The UNIQUE constraint is the authority, not our in-memory set.
-            row = self._conn.execute("SELECT id FROM image WHERE sha1 = %s", (digest,)).fetchone()
+            row = self._exec("SELECT id FROM image WHERE sha1 = %s", (digest,)).fetchone()
             assert row is not None
             image_id, verdict = row[0], "exact_dup"
         else:
@@ -237,7 +281,7 @@ class PostgresWriter:
         page_id = self._pages.get(context.page_url)
         if page_id is None:
             page_id = self.record_page(context.page_url, context.page_title, 200)
-        self._conn.execute(
+        self._exec(
             """
             INSERT INTO image_source (image_id, page_id, alt_text_id)
             VALUES (%s, %s, %s)
@@ -251,7 +295,7 @@ class PostgresWriter:
     def counts(self) -> dict[str, int]:
         out = {}
         for table in ("domain", "page", "image", "image_source", "text_blob"):
-            row = self._conn.execute(f"SELECT count(*) FROM {table}").fetchone()
+            row = self._exec(f"SELECT count(*) FROM {table}").fetchone()
             out[table] = row[0] if row else 0
         return out
 

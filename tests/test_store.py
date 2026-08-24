@@ -368,3 +368,63 @@ def test_guard_error_names_the_fix():
     """An error that only says 'no' costs someone twenty minutes."""
     with pytest.raises(ValueError, match="createdb"):
         require_test_database("postgresql://arc@127.0.0.1:5432/arc_search")
+
+
+# --- connection resilience -------------------------------------------------
+
+
+@pytest.mark.integration
+@needs_pg
+def test_a_dropped_connection_is_replaced_transparently(writer):
+    """A five-hour crawl cannot die because the database blinked.
+
+    An archive run died at startup with 'lost synchronization with server' --
+    a corrupted wire stream, transient (the same query then ran 12/12 by hand),
+    and fatal because nothing reconnected. Worse: a mid-crawl blip would have
+    left every subsequent write failing while the crawler kept fetching pages
+    and storing none of them, looking healthy the whole time.
+    """
+    writer.record_page("https://conf.test/a/", "A", 200)
+    assert writer.reconnects == 0
+
+    writer._conn.close()  # simulate the connection going away
+
+    writer.record_page("https://conf.test/b/", "B", 200)
+    assert writer.reconnects == 1
+    assert writer._conn.execute("SELECT count(*) FROM page").fetchone()[0] == 2
+
+
+@pytest.mark.integration
+@needs_pg
+def test_a_real_sql_error_is_raised_not_swallowed_by_a_reconnect(writer):
+    """The retry must distinguish 'connection is gone' from 'query is wrong'.
+
+    Reconnecting on a constraint violation would hide genuine bugs and retry
+    them forever.
+    """
+    import psycopg
+
+    with pytest.raises(psycopg.Error):
+        writer._exec("SELECT * FROM a_table_that_does_not_exist")
+    assert writer.reconnects == 0, "a bad query must not trigger a reconnect"
+    # ...and the writer is still usable afterwards.
+    writer.record_page("https://conf.test/c/", "C", 200)
+
+
+@pytest.mark.integration
+@needs_pg
+def test_interning_caches_survive_a_reconnect(writer):
+    """Cached ids are committed rows; they stay valid on any connection."""
+    d1 = writer.domain_id("conf.test")
+    writer._conn.close()
+
+    # A cache HIT must not need the database at all, so it must not reconnect.
+    assert writer.domain_id("conf.test") == d1
+    assert writer.reconnects == 0
+
+    # A cache MISS has to go to the database, and that is what triggers the
+    # reconnect -- transparently, with the earlier cached id still correct.
+    d2 = writer.domain_id("other.test")
+    assert writer.reconnects == 1
+    assert d2 != d1
+    assert writer._exec("SELECT count(*) FROM domain").fetchone()[0] == 2

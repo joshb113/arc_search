@@ -654,7 +654,7 @@ async def main(argv: list[str] | None = None) -> int:
 
         try:
             sink = PostgresWriter(IndexSettings().pg_dsn)
-        except psycopg.OperationalError as exc:
+        except psycopg.Error as exc:
             print(
                 f"cannot reach Postgres: {exc}\n"
                 "Start it with `docker compose up -d postgres` (needs ARC_PG_PASSWORD\n"
