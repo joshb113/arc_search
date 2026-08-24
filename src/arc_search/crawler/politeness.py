@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -26,6 +27,7 @@ import structlog
 from protego import Protego
 
 from arc_search.config import CrawlSettings
+from arc_search.crawler.seeds import host_matches
 
 log = structlog.get_logger(__name__)
 
@@ -77,10 +79,34 @@ class Politeness:
             resp = await client.get(url)
     """
 
-    def __init__(self, cfg: CrawlSettings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        cfg: CrawlSettings,
+        client: httpx.AsyncClient,
+        host_rps: Mapping[str, float] | None = None,
+    ) -> None:
         self._cfg = cfg
         self._client = client
         self._hosts: dict[str, _HostState] = {}
+        # Per-host overrides, from Vertical.per_host_rps. Matched by suffix, so
+        # an entry for example.com also governs static.example.com.
+        self._host_rps = dict(host_rps or {})
+
+    def configured_rate(self, host: str) -> float:
+        """Requests per second for this host, before robots.txt is consulted.
+
+        seeds.yaml documents a per-vertical ``per_host_rps`` and says "only
+        ever lower this". It was parsed, validated, and then read by nothing --
+        every host ran at the global default. Harmless when the override was
+        faster; a broken promise when someone set 0.1 for a fragile host and
+        was quietly given 0.5.
+
+        When several entries match, the slowest wins.
+        """
+        rates = [
+            rps for entry, rps in self._host_rps.items() if host_matches(host, entry) and rps > 0
+        ]
+        return min([self._cfg.per_host_rps, *rates])
 
     def _state(self, host: str) -> _HostState:
         st = self._hosts.get(host)
@@ -98,7 +124,7 @@ class Politeness:
             if st.fetched:  # another coroutine won the race
                 return st
 
-            rate = self._cfg.per_host_rps
+            rate = self.configured_rate(host)
             if not self._cfg.respect_robots:
                 st.robots = None
             else:
@@ -129,7 +155,12 @@ class Politeness:
                         st.blocked = True
                         log.info("robots.delay_too_long", host=host, delay=delay)
                     else:
-                        rate = 1.0 / float(delay)
+                        # The SLOWER of the two wins, always. This used to be a
+                        # plain assignment, which meant a site publishing
+                        # Crawl-delay: 1 would SPEED UP a crawler deliberately
+                        # configured to 0.1 rps. Being gentler than robots.txt
+                        # requires is never something to override.
+                        rate = min(rate, 1.0 / float(delay))
 
             st.limiter = TokenBucket(rate, self._cfg.per_host_burst)
             st.fetched = True

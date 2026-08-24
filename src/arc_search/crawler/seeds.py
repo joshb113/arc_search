@@ -92,6 +92,23 @@ class SeedConfig:
     def active(self) -> list[Vertical]:
         return [v for v in self.verticals if v.enabled]
 
+    def host_rate_limits(self) -> dict[str, float]:
+        """``allow_host -> requests/sec`` for every active vertical that sets one.
+
+        Handed to ``Politeness``, which is what finally makes
+        ``Vertical.per_host_rps`` do something. If two verticals claim the same
+        host at different rates, the slower one wins -- a promise to be gentle
+        with a host is not cancelled by a second vertical being in a hurry.
+        """
+        out: dict[str, float] = {}
+        for v in self.active:
+            if not v.per_host_rps or v.per_host_rps <= 0:
+                continue
+            for host in v.allow_hosts:
+                key = host.lower()
+                out[key] = min(out.get(key, v.per_host_rps), v.per_host_rps)
+        return out
+
     def globally_denied(self, host: str) -> bool:
         return any(host_matches(host, entry) for entry in self.global_deny_hosts)
 

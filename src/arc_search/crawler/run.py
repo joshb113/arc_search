@@ -643,7 +643,10 @@ async def main(argv: list[str] | None = None) -> int:
     async with httpx.AsyncClient(
         http2=True, follow_redirects=True, limits=limits, timeout=cfg.timeout_s
     ) as client:
-        fetcher = Fetcher(cfg, client, Politeness(cfg, client))
+        host_rps = seeds.host_rate_limits()
+        if host_rps:
+            log.info("politeness.host_overrides", hosts=host_rps)
+        fetcher = Fetcher(cfg, client, Politeness(cfg, client, host_rps))
         crawler = Crawler(cfg, seeds, fetcher, pages, images, sink)
 
         loop = asyncio.get_running_loop()
