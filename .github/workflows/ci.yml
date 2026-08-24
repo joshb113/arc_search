@@ -1,0 +1,60 @@
+# CI from commit 1.
+#
+# eye_of_web had 34k LOC, zero tests, and zero CI. That is the single reason it
+# was unforkable: it shipped an inverted similarity comparison and two silently
+# dead search paths, and nothing could have caught either.
+#
+# The fast job below installs no GPU stack, no opencv, and no onnxruntime. It
+# covers the pure logic -- URL normalization, frontier persistence, extraction,
+# BK-tree, dedup ordering, crawl scope -- plus the whole crawl loop, which runs
+# against respx rather than the network. It must stay under a minute.
+#
+# httpx/protego are here because the crawl loop is tested, not because anything
+# reaches the network: respx intercepts at the transport layer.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pure-logic deps only
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pytest-asyncio respx ruff \
+                      numpy selectolax structlog \
+                      httpx protego pyyaml pydantic-settings
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format check
+        run: ruff format --check src tests
+
+      - name: Test
+        run: pytest tests -q --cov=arc_search --cov-report=term-missing
+
+  # Runs only on demand: needs the InsightFace model pack and a CUDA device,
+  # neither of which exists on a GitHub runner. Wire this to a self-hosted
+  # runner once there is a GPU box to point it at.
+  gpu:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install full stack
+        run: pip install -e ".[dev]"
+      - name: GPU + integration tests
+        run: pytest tests -q -m "gpu or integration"

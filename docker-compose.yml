@@ -1,0 +1,54 @@
+# All services bind to 127.0.0.1 only. This is deliberate — see README "Legal posture".
+# eye_of_web published 5432 and 19530 on 0.0.0.0 with postgres/postgres.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"   # http
+      - "127.0.0.1:6334:6334"   # grpc
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: arc_search
+      POSTGRES_USER: arc
+      # Set ARC_PG_PASSWORD in .env. No default — an unset password should fail
+      # loudly at startup, not silently become "postgres".
+      POSTGRES_PASSWORD: ${ARC_PG_PASSWORD:?ARC_PG_PASSWORD must be set in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arc -d arc_search"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    # Frontier promotion target. SQLite frontier is the default for <5M URLs;
+    # switch via ARC_FRONTIER_BACKEND=redis when a single crawler process
+    # stops being enough.
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  qdrant_data:
+  pg_data:
+  redis_data:

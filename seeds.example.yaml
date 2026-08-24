@@ -1,0 +1,56 @@
+# Seed configuration -- copy to seeds.yaml and edit.
+#
+# arc_search crawls a BOUNDED set of domains you choose. This is the single most
+# important design decision in the project: density on a vertical you care about
+# beats breadth you cannot afford. It is also what keeps the legal posture
+# defensible, versus scraping search engines or social platforms.
+#
+# Pick a vertical where you have a real reason to search faces and where the
+# corpus is publicly published material. Some workable shapes:
+#   - a sport or competitive scene (event photography, results pages, club sites)
+#   - a music or festival circuit (venue galleries, photographer portfolios)
+#   - a professional field (conference speaker pages, lab/faculty directories)
+#   - a regional news archive
+#   - your own published work, to find where it has been reposted
+
+verticals:
+  - name: example-vertical
+    enabled: false            # flip to true once you have edited the seeds
+
+    seeds:
+      - https://example.com/gallery/
+      - https://example.org/events/
+
+    # Hosts the crawler may follow links into. Anything not matching is dropped
+    # at enqueue time. Leave empty to restrict strictly to the seed hosts.
+    allow_hosts:
+      - example.com
+      - www.example.com
+      - example.org
+
+    # Regex, matched against the full URL. Applied after allow_hosts.
+    deny_patterns:
+      - '/(login|signup|account|cart|checkout)(/|$)'
+      - '\?.*(sort|filter|page)=' # avoid faceted-navigation explosions
+      - '\.(pdf|zip|mp4|mov|avi)$'
+
+    max_depth: 6
+    max_pages: 50000          # hard ceiling per vertical, per run
+
+    # Per-host override of the global politeness setting. Only ever lower this
+    # (i.e. go slower). Sites that publish a Crawl-delay always win.
+    per_host_rps: 0.5
+
+# Hosts to never touch, regardless of what a seed links to. Social platforms and
+# search engines are excluded by default: scraping them is fragile, hostile to
+# their ToS, and legally the worst-shaped version of this project.
+global_deny_hosts:
+  - facebook.com
+  - instagram.com
+  - x.com
+  - twitter.com
+  - linkedin.com
+  - google.com
+  - yandex.ru
+  - tiktok.com
+  - vk.com

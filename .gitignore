@@ -1,0 +1,37 @@
+# secrets / local config
+.env
+seeds.yaml
+
+# crawl artifacts — never commit crop storage or frontier state
+data/
+crops/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# models (InsightFace downloads to ~/.insightface, but keep local copies out)
+models/
+*.onnx
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# obsidian workspace state (keep the rest of .obsidian for shared config)
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+
+# vendored obsidian plugin bundles -- third-party JS, ~8 MB, reinstallable
+# via BRAT. Shared config (app.json, hotkeys, themes) is still committed.
+.obsidian/plugins/
+
+# claudian chat transcripts -- local session state, may quote vault contents
+.claudian/
