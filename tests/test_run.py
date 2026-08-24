@@ -553,3 +553,60 @@ async def test_a_body_read_timeout_counts_as_a_page_failure(tmp_path):
 
     assert stats.pages_failed >= 1
     assert any(k.startswith("exhausted_retries") or "body_read" in k for k in stats.skips)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_image_provenance_survives_a_restart(tmp_path):
+    """The weak labels must not evaporate when a crawl resumes.
+
+    Image context used to live in an in-memory dict beside a durable queue. The
+    queue survived a restart and the dict did not, so every image already
+    queued was recorded with page_url="" and alt=None -- no provenance edge, no
+    weak label. On a live corpus this produced 511 images and ZERO
+    image_source rows while the crawl reported perfect health, and it would
+    have left eval/calibrate with nothing to calibrate against.
+
+    This test forces the exact shape: crawl the pages, stop while the images
+    are still queued, then resume in a fresh Crawler with an empty cache.
+    """
+    _site()
+
+    # Round one: fetch pages only, leaving the discovered images PENDING.
+    async with httpx.AsyncClient() as client:
+        crawler, pages, images, sink = await _build(tmp_path, _cfg(concurrency=1), client)
+        crawler.seed()
+        await crawler._do_page("https://conf.test/speakers/", 0)
+        await crawler._do_page("https://conf.test/speaker/ada/", 1)
+        sink.close()
+        pages.close()
+        images.close()
+
+    # Round two: a brand new process, so nothing is left in memory.
+    async with httpx.AsyncClient() as client:
+        crawler2, _, _, sink2 = await _build(tmp_path, _cfg(concurrency=1), client)
+        assert not hasattr(crawler2, "_ctx"), "context must not live in memory"
+        stats = await crawler2.run()
+        sink2.close()
+
+    rows = _rows(tmp_path)
+    assert rows, "the queued image should have been fetched on resume"
+    ada = next(r for r in rows if r["url"].endswith("ada.jpg"))
+    assert ada["alt"] == "Photo of Ada", "the weak label must survive the restart"
+    assert ada["page_url"] == "https://conf.test/speaker/ada/"
+    assert ada["page_title"] == "Ada"
+    assert stats.skips.get("context_lost", 0) == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_lost_context_is_counted_not_silently_dropped(tmp_path):
+    """If the payload is ever unreadable it must show up in the report."""
+    _site()
+    async with httpx.AsyncClient() as client:
+        crawler, _, images, sink = await _build(tmp_path, _cfg(concurrency=1), client)
+        images.add("https://conf.test/i/ada.jpg", 2, max_depth=10**6, meta="{not json")
+        stats = await crawler.run()
+        sink.close()
+
+    assert stats.skips.get("context_lost", 0) >= 1

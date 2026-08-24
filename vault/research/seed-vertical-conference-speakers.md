@@ -39,6 +39,25 @@ week 3 means a full recrawl.
 
 Coverage confirmed by hand: `/2013/` through `/2025/schedule/speakers/` all 200.
 
+**The label is year-bounded.** Sampled one speaker page per year against the
+live archive on 2026-08-24:
+
+| year | `alt` |
+|---|---|
+| 2013 | — none |
+| 2014 | — none |
+| 2015 | `Photo of BSDCG Team` |
+| 2016 | `Photo of BSDCG Team` |
+| 2019 | `Photo of FOSDEM Staff` |
+| 2022 | `Photo of FOSDEM Staff` |
+| 2025 | `Photo of A. Salt` |
+
+So **11 of 13 crawled years** supply weak labels. 2013–2014 photos are still
+worth having as detection corpus, they just carry no name. Worth knowing
+before reading a fresh crawl's label count as a failure: the frontier is
+breadth-first and the seed list starts at 2013, so the first thousands of
+pages are precisely the two unlabelled years.
+
 ## Robots survey, 2026-08-23
 
 | Host | Verdict | Notes |

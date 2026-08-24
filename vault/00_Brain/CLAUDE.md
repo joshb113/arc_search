@@ -77,6 +77,14 @@ Database tests need `ARC_TEST_PG_DSN` pointing at a database whose name ends in
   `min_face_px`, with a test pinning the relationship.
 - **`--max-pages` is a per-run cap, not a verdict.** Budget-skipped URLs are
   released back to PENDING; they must never be `complete()`d.
+- **Anything needed on dequeue must be IN the queue.** Image provenance lived
+  in an in-memory dict beside the durable frontier; a restart kept the queue
+  and lost the context, so resumed images were written with no page link and
+  no alt text. It is `Frontier.meta` now. 511 images were recorded that way
+  before it was caught — by checking the corpus, not by any test.
+- **FOSDEM alt text is year-bounded**: `Photo of NAME` exists 2015–2025, not
+  2013–2014. Weak labels reading zero early in a crawl is expected — the
+  frontier is breadth-first and the seeds start at 2013.
 - **Scope is re-checked on dequeue**, not just enqueue — the frontier outlives
   the config, so tightening `seeds.yaml` has to affect already-queued URLs.
 

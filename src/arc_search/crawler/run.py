@@ -42,7 +42,7 @@ import signal
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -239,9 +239,6 @@ class Crawler:
         # Verticals that have spent their per-run page budget. Page workers
         # stop leasing once every active vertical is in here.
         self._exhausted: set[str] = set()
-        # Image URL -> the page context that found it. Populated at discovery,
-        # consumed when the image is dequeued. Bounded by the image queue depth.
-        self._ctx: dict[str, ImageContext] = {}
 
     # -- terminal states ---------------------------------------------------
 
@@ -286,7 +283,7 @@ class Crawler:
 
     # -- page worker -------------------------------------------------------
 
-    async def _do_page(self, url: str, depth: int) -> None:
+    async def _do_page(self, url: str, depth: int, meta: str | None = None) -> None:
         vertical = self.vertical_for(url)
         if vertical is None:
             self.stats.note_skip("off_vertical")
@@ -374,36 +371,52 @@ class Crawler:
         # max_depth here is intentionally huge: an image is a leaf, so the depth
         # ceiling that governs link-following must not also silently drop the
         # images found on the deepest legitimate page.
-        if self._images.add(img.url, depth, max_depth=10**6):
+        ctx = ImageContext(
+            page_url=page_url,
+            page_title=title,
+            vertical=vertical.name,
+            depth=depth,
+            alt=img.alt,
+            extractor=img.source,
+            width_hint=img.width_hint,
+        )
+        # The context rides WITH the URL into the durable queue. It used to live
+        # in an in-memory dict; the queue survived restarts and the dict did
+        # not, so every image already queued when a crawl resumed was recorded
+        # with no page link and no alt text -- discarding exactly the weak
+        # labels eval/calibrate is built on, silently.
+        if self._images.add(img.url, depth, max_depth=10**6, meta=json.dumps(asdict(ctx))):
             self.stats.images_seen += 1
             self.stats.by_extractor[img.source] += 1
-            self._ctx[img.url] = ImageContext(
-                page_url=page_url,
-                page_title=title,
-                vertical=vertical.name,
-                depth=depth,
-                alt=img.alt,
-                extractor=img.source,
-                width_hint=img.width_hint,
-            )
 
     # -- image worker ------------------------------------------------------
 
-    async def _do_image(self, url: str, depth: int) -> None:
-        ctx = self._ctx.pop(
-            url,
-            # A restart loses the in-memory map; the queue survives. Record what
-            # we still know rather than dropping a legitimately queued image.
-            ImageContext(
-                page_url="",
-                page_title=None,
-                vertical=(self.vertical_for(url) or Vertical("?", [])).name,
-                depth=depth,
-                alt=None,
-                extractor="resumed",
-                width_hint=None,
-            ),
+    def _context_from(self, meta: str | None, url: str, depth: int) -> ImageContext:
+        """Rebuild an image's provenance from its queued payload.
+
+        A missing or unreadable payload is a real loss of information, not a
+        formatting detail: without ``page_url`` the writer cannot link the image
+        to a page and the alt text -- the weak label -- goes nowhere. It is
+        counted as a skip so it shows up in the report instead of vanishing.
+        """
+        if meta:
+            try:
+                return ImageContext(**json.loads(meta))
+            except (ValueError, TypeError) as exc:
+                log.warning("image.context_unreadable", url=url, error=str(exc))
+        self.stats.note_skip("context_lost")
+        return ImageContext(
+            page_url="",
+            page_title=None,
+            vertical=(self.vertical_for(url) or Vertical("?", [])).name,
+            depth=depth,
+            alt=None,
+            extractor="resumed",
+            width_hint=None,
         )
+
+    async def _do_image(self, url: str, depth: int, meta: str | None = None) -> None:
+        ctx = self._context_from(meta, url, depth)
         try:
             got = await self._fetch.get_image(url)
         except Skipped as s:
@@ -457,7 +470,7 @@ class Crawler:
             task = leased[0]
             self._inflight += 1
             try:
-                await handler(task.url, task.depth)
+                await handler(task.url, task.depth, task.meta)
             except Exception:
                 # Deliberately broad: one malformed page must not take a worker
                 # down and strand the rest of the queue behind it.

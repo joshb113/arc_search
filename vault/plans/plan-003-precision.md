@@ -13,6 +13,11 @@
 - [ ] Build it from FOSDEM's `alt="Photo of NAME"` — a weak label supplied by the
       publisher, which the crawler already records. **40 of 40** images in the first
       Postgres run carried one.
+      ⚠️ **The label is year-bounded: 2015–2025 carry it, 2013–2014 do not.**
+      Measured directly against the archive, one speaker page per year. So the
+      eval set draws on 11 of 13 crawled years; the 2013–2014 photos are
+      detection corpus only. A run whose labels read zero is not necessarily
+      broken — check which years it has reached first.
 - [ ] Populate `eval_pair` — same-person pairs are the same speaker across years and
       across conferences
 

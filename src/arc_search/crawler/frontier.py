@@ -33,7 +33,18 @@ CREATE TABLE IF NOT EXISTS frontier (
     depth     INTEGER NOT NULL,
     state     INTEGER NOT NULL DEFAULT 0,   -- 0 pending, 1 in-flight, 2 done, 3 failed
     attempts  INTEGER NOT NULL DEFAULT 0,
-    added_at  REAL NOT NULL
+    added_at  REAL NOT NULL,
+
+    -- Opaque caller payload, carried with the queued URL. The frontier does not
+    -- interpret it; the crawler stores an image's provenance here (the page it
+    -- was found on, its title, and its alt text).
+    --
+    -- This column exists because that context used to live in an in-memory dict
+    -- beside a durable queue. The queue survived restarts and the context did
+    -- not, so every image already queued at restart was recorded with no page
+    -- link and NO ALT TEXT -- silently discarding the weak labels the whole
+    -- calibration plan is built on, while the crawl reported perfect health.
+    meta      TEXT
 );
 CREATE INDEX IF NOT EXISTS frontier_pending ON frontier (state, depth, added_at);
 CREATE INDEX IF NOT EXISTS frontier_host    ON frontier (host, state);
@@ -82,6 +93,7 @@ class Task:
     host: str
     depth: int
     attempts: int
+    meta: str | None = None
 
 
 class Frontier:
@@ -97,8 +109,20 @@ class Frontier:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(_SCHEMA)
+        self._migrate()
 
-    def add(self, url: str, depth: int, max_depth: int) -> bool:
+    def _migrate(self) -> None:
+        """Bring an existing frontier file up to the current schema.
+
+        CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+        so a frontier written before `meta` would keep working right up until
+        the first query naming that column.
+        """
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(frontier)")}
+        if "meta" not in cols:
+            self._db.execute("ALTER TABLE frontier ADD COLUMN meta TEXT")
+
+    def add(self, url: str, depth: int, max_depth: int, meta: str | None = None) -> bool:
         """Enqueue. Returns False if already known or too deep.
 
         Note the ordering: over-depth URLs are still RECORDED (as DONE), so a
@@ -110,9 +134,9 @@ class Frontier:
         host = urlsplit(url).hostname or ""
         state = DONE if depth > max_depth else PENDING
         cur = self._db.execute(
-            "INSERT OR IGNORE INTO frontier (url_key, url, host, depth, state, added_at) "
-            "VALUES (?, ?, ?, ?, ?, strftime('%s','now'))",
-            (key, url, host, depth, state),
+            "INSERT OR IGNORE INTO frontier (url_key, url, host, depth, state, added_at, meta) "
+            "VALUES (?, ?, ?, ?, ?, strftime('%s','now'), ?)",
+            (key, url, host, depth, state, meta),
         )
         return cur.rowcount > 0 and state == PENDING
 
@@ -120,7 +144,7 @@ class Frontier:
         """Claim pending URLs, marking them in-flight so a concurrent worker or a
         restart does not double-fetch."""
         rows = self._db.execute(
-            "SELECT url_key, url, host, depth, attempts FROM frontier "
+            "SELECT url_key, url, host, depth, attempts, meta FROM frontier "
             "WHERE state = ? ORDER BY depth, added_at LIMIT ?",
             (PENDING, limit),
         ).fetchall()
@@ -132,7 +156,7 @@ class Frontier:
             f"WHERE url_key IN ({','.join('?' * len(keys))})",
             keys,
         )
-        return [Task(url=r[1], host=r[2], depth=r[3], attempts=r[4]) for r in rows]
+        return [Task(url=r[1], host=r[2], depth=r[3], attempts=r[4], meta=r[5]) for r in rows]
 
     def complete(self, url: str) -> None:
         self._db.execute("UPDATE frontier SET state = ? WHERE url_key = ?", (DONE, url_key(url)))

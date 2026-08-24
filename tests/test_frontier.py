@@ -127,3 +127,56 @@ class TestFrontier:
         frontier.add("https://x.com/shallow", depth=0, max_depth=5)
         tasks = frontier.lease(2)
         assert tasks[0].url.endswith("/shallow")
+
+
+def test_meta_rides_with_the_url_and_survives_reopen(tmp_path):
+    """Anything the caller needs on dequeue has to be IN the queue.
+
+    The crawler kept image provenance in a dict beside this table. The table
+    survived restarts and the dict did not.
+    """
+    from arc_search.crawler.frontier import Frontier
+
+    path = tmp_path / "f.sqlite"
+    f = Frontier(path)
+    f.add("https://h.test/i.jpg", 2, 6, meta='{"alt": "Photo of Ada"}')
+    f.close()
+
+    reopened = Frontier(path)
+    task = reopened.lease(1)[0]
+    assert task.meta == '{"alt": "Photo of Ada"}'
+    reopened.close()
+
+
+def test_meta_is_optional(tmp_path):
+    from arc_search.crawler.frontier import Frontier
+
+    f = Frontier(tmp_path / "f.sqlite")
+    f.add("https://h.test/p", 0, 6)
+    assert f.lease(1)[0].meta is None
+    f.close()
+
+
+def test_a_frontier_written_before_meta_still_opens(tmp_path):
+    """CREATE TABLE IF NOT EXISTS does nothing to an existing table, so an old
+    frontier file would work right up until the first query naming `meta`."""
+    import sqlite3
+
+    from arc_search.crawler.frontier import Frontier
+
+    path = tmp_path / "old.sqlite"
+    db = sqlite3.connect(path, isolation_level=None)
+    db.executescript("""
+        CREATE TABLE frontier (
+            url_key TEXT PRIMARY KEY, url TEXT NOT NULL, host TEXT NOT NULL,
+            depth INTEGER NOT NULL, state INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0, added_at REAL NOT NULL);
+        INSERT INTO frontier VALUES ('k','https://h.test/p','h.test',0,0,0,0);
+    """)
+    db.close()
+
+    f = Frontier(path)  # must migrate, not explode
+    task = f.lease(1)[0]
+    assert task.url == "https://h.test/p"
+    assert task.meta is None
+    f.close()

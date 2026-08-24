@@ -40,6 +40,10 @@ surviving a deliberate `kill -9` and resuming.
 - [x] Connection resilience — a transient blip must not end a five-hour run
       ([[00_Brain/ISSUES_INDEX#ISS-003]])
 - [x] Store the image URL — [[ADR-003-store-image-urls]]
+- [x] **Image provenance survives a restart** — the context rode in an
+      in-memory dict beside a durable queue. On resume every already-queued
+      image was written with no page link and no alt text. `Frontier.meta`
+      now carries it with the URL.
 
 ## Phase 4 – The archive run 🟡
 
