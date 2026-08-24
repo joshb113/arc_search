@@ -6,13 +6,30 @@ Python. InsightFace (antelopev2/R100) + Qdrant + Postgres.
 **Goal:** Yandex-class face search over a corpus you own, running entirely on
 local hardware. No third-party image search. No data leaves the machine.
 
-**Start every session by reading:**
+**Start every session with `/start`**, or read these by hand:
 
-> ### 📖 `vault/plans/INDEX.md` — current phase, milestones, open questions
+> ### 📖 `vault/00_Brain/CLAUDE.md` — working state, live numbers, traps
+> ### 📖 `vault/plans/INDEX.md` — plan table, status, open questions
+> ### 📖 `vault/00_Brain/handoffs/handoff-latest.md` — where the last session stopped
 > ### 📖 `vault/decisions/` — ADRs. Do not relitigate these without a new ADR.
+
+This file is the **contract** — non-negotiables, layout, scale target — and
+changes only with an ADR. `vault/00_Brain/CLAUDE.md` is the **working state** and
+changes freely as facts change.
 
 This vault root is also the project root: engine code goes in `src/`, planning
 and research live in `vault/`. There is exactly one vault, and it is here.
+
+## Vault layout
+
+```
+vault/00_Brain/     working state, handoffs, ISSUES_INDEX (external-cause issues)
+vault/plans/        INDEX.md (table) + plan-NNN-*.md
+vault/decisions/    ADR-NNN-*.md
+vault/research/     audits and measurements
+vault/tasks/        active / backlog / completed
+.claude/commands/   /start /status /plan /adr /audit /focus /handoff /wrap-up
+```
 
 ---
 
