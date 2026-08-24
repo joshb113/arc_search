@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
+from tests.conftest import make_image
 
 from arc_search.config import CrawlSettings
 from arc_search.crawler.fetch import (
@@ -25,8 +26,14 @@ from arc_search.crawler.fetch import (
 )
 from arc_search.crawler.politeness import Politeness
 
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 20_000
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20_000
+# Real encoded images. get_image() reads headers now, so a hand-written magic
+# prefix would be rejected as unreadable_header. See conftest.
+JPEG = make_image(0, "JPEG")
+PNG = make_image(1, "PNG")
+
+# Deliberately NOT decodable: magic bytes only. Used where the test asserts on
+# behaviour that must fire before the header is ever parsed.
+FAKE_JPEG_PREFIX = b"\xff\xd8\xff\xe0" + b"\x00" * 20_000
 
 
 def cfg(**kw) -> CrawlSettings:

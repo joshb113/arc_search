@@ -168,6 +168,16 @@ _GROUPS: tuple[tuple[str, type[BaseSettings]], ...] = (
 )
 
 
+# ARC_-prefixed variables that are deliberately NOT pydantic fields. Without
+# this, the typo check flags the project's own required variables.
+_EXTERNAL_VARS = frozenset(
+    {
+        "ARC_PG_PASSWORD",  # consumed by docker-compose.yml, never by the app
+        "ARC_TEST_PG_DSN",  # opt-in switch for the integration tests
+    }
+)
+
+
 def unknown_settings(source: dict[str, str] | None = None) -> list[str]:
     """Names of ``ARC_*`` variables that match no field on any settings group.
 
@@ -184,7 +194,7 @@ def unknown_settings(source: dict[str, str] | None = None) -> list[str]:
     import os
 
     env = dict(os.environ) if source is None else dict(source)
-    known: set[str] = set()
+    known: set[str] = set(_EXTERNAL_VARS)
     for prefix, cls in _GROUPS:
         known |= {prefix + name.upper() for name in cls.model_fields}
 

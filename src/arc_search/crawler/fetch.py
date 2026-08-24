@@ -37,6 +37,7 @@ single blip.
 
 from __future__ import annotations
 
+import io
 import random
 from dataclasses import dataclass
 from typing import Literal
@@ -166,6 +167,32 @@ def backoff_delay(attempt: int, cfg: CrawlSettings, *, rand: random.Random | Non
     return rnd.uniform(0.0, ceiling)
 
 
+def image_dimensions(body: bytes) -> tuple[int, int] | None:
+    """``(width, height)`` from the image header, or None if unreadable.
+
+    ``Image.open`` parses only the header and leaves the pixels alone, so this
+    costs microseconds and no meaningful memory -- it is not a decode. Two
+    things depend on it:
+
+    1. ``image.width``/``height`` are NOT NULL in the schema. Without this the
+       crawl tier could not populate its own table.
+    2. ``min_image_dim`` finally does something. Byte size alone does not
+       separate a 96x96 sponsor logo from a 400x400 portrait; on the FOSDEM
+       run, logos cleared the 8 KB floor comfortably.
+
+    Corrupt or truncated headers return None rather than raising: a malformed
+    image is a skip, not a crawl failure.
+    """
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(body)) as im:
+            w, h = im.size
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+    return (int(w), int(h)) if w > 0 and h > 0 else None
+
+
 @dataclass(frozen=True)
 class Fetched:
     url: str
@@ -174,6 +201,8 @@ class Fetched:
     content_type: str
     kind: Literal["html", "image", "other"]
     body: bytes
+    width: int | None = None
+    height: int | None = None
     from_cache: bool = False
 
     @property
@@ -313,6 +342,17 @@ class Fetcher:
         if sniffed not in IMAGE_TYPES:
             raise Skipped(url, f"image_subtype_unusable:{sniffed}")
 
+        dims = image_dimensions(body)
+        if dims is None:
+            # Sniffed as an image but the header will not parse: truncated
+            # download or a genuinely corrupt file. Nothing downstream can use
+            # it, and image.width is NOT NULL.
+            raise Skipped(url, f"unreadable_header:{sniffed}")
+        width, height = dims
+        floor = self._cfg.min_image_dim
+        if width < floor or height < floor:
+            raise Skipped(url, f"too_small_dim:{width}x{height}")
+
         return Fetched(
             url=url,
             final_url=str(resp.url),
@@ -320,6 +360,8 @@ class Fetcher:
             content_type=sniffed,
             kind="image",
             body=body,
+            width=width,
+            height=height,
         )
 
     async def _request(self, method: str, url: str, **kw: object) -> httpx.Response:

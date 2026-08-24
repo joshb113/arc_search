@@ -23,9 +23,16 @@ Prove extraction and storage before adding a model to the loop.
 - [x] First bounded live run — 40 pages of FOSDEM `/2025/`, 0 failures, 0 robots
       exclusions, 8/8 speaker photos with weak labels after one tuning pass.
       Numbers in [[seed-vertical-conference-speakers]].
-- [ ] Full FOSDEM archive run (~5 h at 1 rps across 13 years)
-- [ ] Postgres writer for `domain`/`url_path`/`page`/`image`/`image_source`
-      (replaces `MetadataSink`)
+- [x] Postgres writer for `domain`/`url_path`/`page`/`image`/`image_source`
+      — `index/store.py`. Dedup is seeded from the `image` table at startup, so
+      resume is correct by construction. `--sink postgres` is now the default;
+      `--sink jsonl` remains for throwaway runs.
+- [ ] **Verify the writer against a live Postgres.** Written and unit-tested,
+      but its 8 integration tests have never run — Docker needs WSL2, which is
+      not installed on this machine. Blocked on an elevated `wsl --install`
+      and a reboot.
+- [ ] Full FOSDEM archive run (~5 h at 1 rps across 13 years) — do this
+      *after* the writer is verified, not before
 - [ ] Crawl to 100k images
 - [ ] Report: images/host, extraction source breakdown, robots exclusion rate
       — `CrawlStats.report()` already emits all three

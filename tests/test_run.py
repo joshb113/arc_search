@@ -14,6 +14,7 @@ import json
 import httpx
 import pytest
 import respx
+from tests.conftest import make_image
 
 from arc_search.config import CrawlSettings
 from arc_search.crawler.fetch import Fetcher
@@ -23,8 +24,10 @@ from arc_search.crawler.run import Crawler, MetadataSink, all_loopback, check_us
 from arc_search.crawler.seeds import SeedConfig, Vertical
 from arc_search.index.dedup import Deduper
 
-JPEG_A = b"\xff\xd8\xff\xe0" + b"A" * 20_000
-JPEG_B = b"\xff\xd8\xff\xe0" + b"B" * 20_000
+# Real encoded JPEGs. The fetch path reads image headers now, so a hand-written
+# magic-byte prefix is no longer a usable fixture. See conftest.
+JPEG_A = make_image(1, "JPEG")
+JPEG_B = make_image(2, "JPEG")
 
 INDEX = """
 <html><head><title>Speakers</title></head><body>

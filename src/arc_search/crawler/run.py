@@ -66,13 +66,24 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class ImageSink(Protocol):
-    """What happens to an image's bytes. The bytes are not valid after return."""
+class CrawlSink(Protocol):
+    """Where crawl results go. The image bytes are not valid after return."""
+
+    def record_page(self, url: str, title: str | None, status: int) -> object:
+        """Called for EVERY fetched page, including ones with no images.
+
+        Recording only pages that yielded images would under-report the crawl
+        and leave the recrawl reaper with nothing to sweep.
+        """
 
     def handle(self, fetched: Fetched, context: ImageContext) -> str:
         """Return a short verdict string for the stats counter."""
 
     def close(self) -> None: ...
+
+
+# Retained name: the old protocol was image-only.
+ImageSink = CrawlSink
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,13 @@ class MetadataSink:
         self._dedup = deduper
         self._next_id = 0
 
+    def record_page(self, url: str, title: str | None, status: int) -> None:
+        """No-op. JSONL keeps page context on the image rows instead.
+
+        This sink does not attempt page-level bookkeeping; use PostgresWriter
+        for a run whose page table you intend to keep.
+        """
+
     def handle(self, fetched: Fetched, context: ImageContext) -> str:
         if (hit := self._dedup.check_bytes(fetched.body)) is not None:
             return str(hit.verdict)
@@ -120,6 +138,8 @@ class MetadataSink:
                     "sha1": digest.hex(),
                     "bytes": len(fetched.body),
                     "content_type": fetched.content_type,
+                    "width": fetched.width,
+                    "height": fetched.height,
                     "page_url": context.page_url,
                     "page_title": context.page_title,
                     "vertical": context.vertical,
@@ -293,6 +313,7 @@ class Crawler:
         html = page.text
         base = page.final_url
         title = page_title(html)
+        self._sink.record_page(base, title, page.status)
 
         # Links, at depth + 1. Frontier.add records over-depth URLs as DONE
         # rather than dropping them, so rediscovery is free.
@@ -520,6 +541,16 @@ async def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=Path("data/images.jsonl"))
     ap.add_argument("--concurrency", type=int, default=None)
     ap.add_argument("--max-pages", type=int, default=None, help="override every vertical")
+    ap.add_argument(
+        "--sink",
+        choices=("postgres", "jsonl"),
+        default="postgres",
+        help=(
+            "postgres (default): resumable, page table, dedup seeded from the "
+            "image table. jsonl: no dependencies, but restarts re-record "
+            "everything -- smoke tests only."
+        ),
+    )
     args = ap.parse_args(argv)
 
     structlog.configure(processors=[structlog.dev.ConsoleRenderer()])
@@ -555,7 +586,33 @@ async def main(argv: list[str] | None = None) -> int:
     frontier_path = args.frontier or cfg.frontier_path
     pages = Frontier(frontier_path)
     images = Frontier(frontier_path.with_name(frontier_path.stem + "-images.sqlite"))
-    sink = MetadataSink(args.out, Deduper())
+
+    sink: CrawlSink
+    if args.sink == "postgres":
+        # Imported here, not at module scope: psycopg is not needed for a jsonl
+        # run and the crawl tier should not require a database driver to start.
+        import psycopg
+
+        from arc_search.config import IndexSettings
+        from arc_search.index.store import PostgresWriter
+
+        try:
+            sink = PostgresWriter(IndexSettings().pg_dsn)
+        except psycopg.OperationalError as exc:
+            print(
+                f"cannot reach Postgres: {exc}\n"
+                "Start it with `docker compose up -d postgres` (needs ARC_PG_PASSWORD\n"
+                "in .env), or run with --sink jsonl for a throwaway crawl.",
+                file=sys.stderr,
+            )
+            return 2
+        log.info("sink.postgres", resumed_images=sink.loaded)
+    else:
+        sink = MetadataSink(args.out, Deduper())
+        log.warning(
+            "sink.jsonl",
+            hint="restarts re-record everything; use --sink postgres for a real run",
+        )
 
     limits = httpx.Limits(max_connections=cfg.concurrency * 2, max_keepalive_connections=32)
     async with httpx.AsyncClient(
@@ -572,11 +629,17 @@ async def main(argv: list[str] | None = None) -> int:
         try:
             stats = await crawler.run()
         finally:
+            table_counts = sink.counts() if hasattr(sink, "counts") else None
             sink.close()
             pages.close()
             images.close()
 
     print(stats.report())
+    if table_counts:
+        print("  postgres row counts")
+        for table, n in table_counts.items():
+            print(f"    {table:<38} {n:>8}")
+        print()
     return 0
 
 
