@@ -31,6 +31,62 @@ from arc_search.config import FaceSettings
 log = structlog.get_logger(__name__)
 
 
+def register_cuda_runtime() -> list[str]:
+    """Put the pip-installed NVIDIA runtime DLLs on the Windows search path.
+
+    Returns the directories added, newest-first. Safe to call repeatedly, and a
+    no-op off Windows, where the wheels ship .so files and the rpath is correct.
+
+    WHY THIS EXISTS
+    ---------------
+    ``onnxruntime-gpu[cuda,cudnn]`` installs the CUDA runtime as wheels under
+    ``site-packages/nvidia/``. onnxruntime then loads
+    ``onnxruntime_providers_cuda.dll`` **by absolute path**, and Windows resolves
+    that DLL's own imports -- cublasLt, cudnn, cufft -- using the standard search
+    order, which does not include those wheel directories. The provider fails to
+    load with a bare "cublasLt64_13.dll is missing".
+
+    ``os.add_dll_directory`` does NOT fix this. It affects DLLs loaded with
+    LOAD_LIBRARY_SEARCH_USER_DIRS, not the transitive dependency resolution of a
+    DLL loaded by full path. Verified: registering the directories changed
+    nothing, prepending them to PATH fixed it outright.
+
+    And the failure is SILENT. onnxruntime writes one line to stderr and every
+    session falls back to CPU -- pyproject.toml calls that a ~20x throughput
+    loss, which at 10M faces is the difference between days and months. Nothing
+    raises. ``FaceExtractor.effective_providers()`` is the compensating check.
+
+    The newer wheels use a consolidated ``nvidia/cu13/bin/x86_64`` layout rather
+    than the old per-library ``nvidia/<lib>/bin``, so this globs for any
+    directory under ``nvidia/`` that actually contains DLLs instead of hardcoding
+    either shape.
+    """
+    import os
+    import sys
+    import sysconfig
+
+    if sys.platform != "win32":
+        return []
+
+    root = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
+    if not root.is_dir():
+        return []
+
+    found = [
+        str(d)
+        for d in sorted(root.rglob("*"))
+        if d.is_dir() and any(f.suffix.lower() == ".dll" for f in d.iterdir() if f.is_file())
+    ]
+    if not found:
+        return []
+
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    missing = [d for d in found if d not in current]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join(missing + current)
+    return found
+
+
 @dataclass(frozen=True)
 class Face:
     qdrant_id: uuid.UUID
@@ -64,18 +120,70 @@ class FaceExtractor:
         self._cfg = cfg
         self._app = None  # lazy: importing insightface costs ~2s
 
+    def effective_providers(self) -> dict[str, list[str]]:
+        """What each loaded model is ACTUALLY running on.
+
+        Not what was requested. onnxruntime falls back to CPU silently when the
+        CUDA execution provider cannot load its DLLs -- it writes a line to
+        stderr and carries on -- so the only way to know is to ask the sessions
+        afterwards.
+        """
+        if self._app is None:
+            return {}
+        out: dict[str, list[str]] = {}
+        for name, model in self._app.models.items():
+            session = getattr(model, "session", None)
+            if session is not None:
+                out[name] = list(session.get_providers())
+        return out
+
     def _ensure_app(self):
         if self._app is None:
+            # BEFORE importing insightface: it imports onnxruntime at module
+            # scope, and the provider DLLs are resolved at that point.
+            if "CUDAExecutionProvider" in self._cfg.providers:
+                dll_dirs = register_cuda_runtime()
+                if dll_dirs:
+                    log.debug("faces.cuda_runtime_registered", dirs=dll_dirs)
+
             from insightface.app import FaceAnalysis
 
             app = FaceAnalysis(name=self._cfg.model_pack, providers=list(self._cfg.providers))
             app.prepare(ctx_id=0, det_size=self._cfg.det_size, det_thresh=self._cfg.det_thresh)
             self._app = app
+
+            # Report the EFFECTIVE provider, never the requested one. This is the
+            # same defect the crawler shipped and fixed: the startup log printed
+            # the requested per-host rate while the crawl ran at half of it, so
+            # the log agreed with the config and disagreed with reality.
+            #
+            # Here the stakes are higher. onnxruntime does not raise when the
+            # CUDA provider fails to load -- a missing cublasLt DLL prints to
+            # stderr and every session quietly falls back to CPU. pyproject.toml
+            # puts that at a ~20x throughput loss, which at 10M faces is the
+            # difference between days and months, and the only symptom is that
+            # the run is slow.
+            providers = self.effective_providers()
+            active = sorted({p for ps in providers.values() for p in ps})
+            on_cpu = [name for name, ps in providers.items() if ps == ["CPUExecutionProvider"]]
+
             log.info(
                 "faces.model_ready",
                 pack=self._cfg.model_pack,
-                providers=self._cfg.providers,
+                requested=list(self._cfg.providers),
+                effective=active,
+                models=len(providers),
             )
+            if on_cpu and "CUDAExecutionProvider" in self._cfg.providers:
+                log.warning(
+                    "faces.cuda_unavailable",
+                    detail="CUDA was requested but these models loaded on CPU; "
+                    "expect a ~20x throughput loss. Check that the CUDA runtime "
+                    "DLLs onnxruntime-gpu links against are installed and that "
+                    "its CUDA major version matches them.",
+                    cpu_models=sorted(on_cpu),
+                    requested=list(self._cfg.providers),
+                )
         return self._app
 
     # ------------------------------------------------------------------ gate
