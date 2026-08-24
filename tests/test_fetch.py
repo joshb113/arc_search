@@ -326,3 +326,59 @@ def test_fetched_text_survives_bad_encoding():
         body=b"caf\xe9",  # latin-1 in a utf-8 world
     )
     assert "caf" in f.text  # replaced, not raised
+
+
+# --- body-read failures ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_timeout_reading_the_page_body_is_a_retryable_fetch_error():
+    """The retry in _request covers the request and headers, not the body.
+
+    A slow host timing out mid-transfer used to escape the fetch error model
+    completely: not Skipped, not FetchError, so it fell through to the worker's
+    catch-all, was logged as "worker.crashed" with a full traceback, and was
+    NOT counted as a page failure. A single 18-page validation crawl against
+    media.ccc.de hit this three times, and the report said "pages failed 0".
+    """
+    respx.get("https://h.test/p").mock(side_effect=httpx.ReadTimeout("boom"))
+    async with httpx.AsyncClient() as client:
+        f = await _fetcher(client, cfg(max_retries=1))
+        with pytest.raises(FetchError) as ei:
+            await f.get_page("https://h.test/p")
+    assert ei.value.retryable is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_timeout_reading_an_image_body_is_a_retryable_fetch_error():
+    respx.get("https://h.test/i.jpg").mock(side_effect=httpx.ReadTimeout("boom"))
+    async with httpx.AsyncClient() as client:
+        f = await _fetcher(client, cfg(max_retries=1))
+        with pytest.raises(FetchError) as ei:
+            await f.get_image("https://h.test/i.jpg")
+    assert ei.value.retryable is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_size_cap_still_raises_skipped_not_fetcherror():
+    """Skipped is not an httpx.HTTPError, so the new handler must not eat it.
+
+    Conflating the two would send a 40 MB TIFF back to the frontier to be
+    retried four times.
+    """
+    # An understated Content-Length, so the header screen passes and the cap
+    # has to fire mid-stream -- which is the path the new handler wraps.
+    respx.get("https://h.test/big.jpg").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"\xff\xd8\xff" + b"\x00" * 200_000,
+            headers={"content-type": "image/jpeg", "content-length": "20000"},
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        f = await _fetcher(client, cfg(max_image_bytes=50_000))
+        with pytest.raises(Skipped, match="stream_exceeded_cap"):
+            await f.get_image("https://h.test/big.jpg")

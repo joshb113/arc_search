@@ -200,6 +200,58 @@ sustained afterwards, halving the archive run to ~5 h.
 
 The harness is kept at `tools/profile_crawl_loop.py`.
 
+## ccc-media validation, 2026-08-24
+
+15-page bounded run against `media.ccc.de`. **Verdict: keep it, with denies.**
+
+Mechanically sound — 18 pages, 130 images, 0 failed, 0 robots exclusions, and
+`effective_rps={'media.ccc.de': 0.5}` confirms the per-vertical override
+lowering below the 1.0 global for real.
+
+Content, though, was 70% waste:
+
+| | count | share |
+|---|---|---|
+| conference logos | 86 | 70% |
+| video thumbnails (400x225) | 37 | 30% |
+
+The seeds `/b/congress` and `/b/conferences` are *browse* pages — they list
+conferences by logo. The thumbnails are deeper. Logos are all named `logo.*`,
+`media-logo.*`, `unknown.*` or live under `/logos/`, so three deny patterns
+remove them.
+
+Confirmed as predicted: **no weak labels.** The thumbnail alt text is the talk
+title (`"Von Ubuntu zu Debian: Ein neuer Upstream für TUXEDO OS"`), not a
+speaker name. Detection corpus only, not eval material — which is what this
+vertical is here for: on-stage faces, off-axis and variably lit, as a
+counterweight to FOSDEM's clean portraits.
+
+Two bugs the run exposed, neither related to ccc:
+
+1. **Body-read timeouts escaped the fetch error model.** `_request` retries the
+   request and headers; `resp.aread()` was outside any handler. A slow host
+   timing out mid-transfer produced neither `Skipped` nor `FetchError`, so it
+   fell through to the worker catch-all, logged `worker.crashed` with a full
+   traceback, and **was not counted as a page failure** — the report said
+   "pages failed 0" while three pages had timed out. FOSDEM is fast enough that
+   this never appeared; media.ccc.de is not.
+2. **The page budget overshoots by `n_page - 1`.** `--max-pages 15` fetched 18.
+   Check-then-increment with an `await` between lets every page worker pass the
+   check before any increments. The slot is now reserved before the await and
+   handed back if the fetch yields no page.
+
+## Open: the image URL is never stored
+
+`image` holds sha1, dimensions and byte size — no URL. So you cannot re-fetch an
+image, cannot write URL-based deny rules from corpus analysis (I had to re-fetch
+a page by hand to find the logo naming above), and provenance only reaches the
+*page*, not the file.
+
+Adding it is not free: image paths are near-unique, so interning saves little,
+and `url_path` would grow to roughly one row per image — order 1 GB at 10M
+against a 48 GB total budget. That is an ADR-sized decision, not a casual
+schema edit. Flagging, not deciding.
+
 ## Caveats to carry into week 2
 
 - **FOSDEM photos are portraits.** A threshold calibrated on nothing but clean

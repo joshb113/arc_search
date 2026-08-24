@@ -291,8 +291,19 @@ class Fetcher:
         if not is_html(ctype):
             await resp.aclose()
             raise Skipped(url, f"not_html:{ctype or 'unknown'}")
-        body = await resp.aread()
-        await resp.aclose()
+        try:
+            body = await resp.aread()
+        except httpx.HTTPError as exc:
+            # The retry in _request covers sending the request and receiving
+            # headers. It does NOT cover the body, and a slow host will time
+            # out mid-transfer -- at which point this escaped the fetch error
+            # model entirely, fell through to the worker's catch-all, and got
+            # logged as "worker.crashed" with a full traceback while NOT being
+            # counted as a page failure. Three of these on a single 18-page
+            # validation crawl, all invisible in the report.
+            raise FetchError(url, f"body_read_failed:{type(exc).__name__}", retryable=True) from exc
+        finally:
+            await resp.aclose()
         return Fetched(
             url=url,
             final_url=str(resp.url),
@@ -338,6 +349,11 @@ class Fetcher:
                     # one. Either way we stop paying for it now.
                     raise Skipped(url, f"stream_exceeded_cap:{cap}B")
                 chunks.append(chunk)
+        except httpx.HTTPError as exc:
+            # Same gap as get_page: a timeout part-way through the body is a
+            # normal transient, not an unclassified crash. Skipped is not an
+            # HTTPError, so the size cap above still propagates untouched.
+            raise FetchError(url, f"body_read_failed:{type(exc).__name__}", retryable=True) from exc
         finally:
             await resp.aclose()
 

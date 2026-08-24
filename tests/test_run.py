@@ -508,3 +508,48 @@ async def test_a_budgeted_run_still_terminates(tmp_path):
         sink.close()
 
     assert stats.pages_fetched == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_page_budget_is_not_overshot_by_concurrent_workers(tmp_path):
+    """check-then-increment with an await between is a race across workers.
+
+    Every page worker can pass the budget check before any of them increments,
+    so `--max-pages 15` fetched 18 pages with four workers -- over by exactly
+    n_page - 1. Harmless here; not harmless against a metered or fragile host.
+    """
+    respx.get("https://conf.test/robots.txt").mock(return_value=httpx.Response(404))
+    links = "".join(f'<a href="/p/{i}/">p{i}</a>' for i in range(40))
+    respx.get("https://conf.test/speakers/").mock(
+        return_value=httpx.Response(200, html=f"<html><body>{links}</body></html>")
+    )
+    for i in range(40):
+        respx.get(f"https://conf.test/p/{i}/").mock(
+            return_value=httpx.Response(200, html="<html><body>x</body></html>")
+        )
+
+    seeds = _seeds()
+    seeds.verticals[0].max_pages = 5
+    async with httpx.AsyncClient() as client:
+        crawler, _, _, sink = await _build(tmp_path, _cfg(concurrency=16), client, seeds)
+        stats = await crawler.run()
+        sink.close()
+
+    assert stats.pages_fetched == 5, "max_pages is a cap, not a suggestion"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_body_read_timeout_counts_as_a_page_failure(tmp_path):
+    """It was logged as worker.crashed and reported as 'pages failed 0'."""
+    _site()
+    respx.get("https://conf.test/speaker/ada/").mock(side_effect=httpx.ReadTimeout("boom"))
+
+    async with httpx.AsyncClient() as client:
+        crawler, _, _, sink = await _build(tmp_path, _cfg(max_retries=1), client)
+        stats = await crawler.run()
+        sink.close()
+
+    assert stats.pages_failed >= 1
+    assert any(k.startswith("exhausted_retries") or "body_read" in k for k in stats.skips)

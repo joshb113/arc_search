@@ -315,19 +315,27 @@ class Crawler:
             self._pages.complete(url)
             return
 
+        # Reserve the budget slot BEFORE awaiting. Check-then-increment with an
+        # await in between lets every page worker pass the check before any of
+        # them increments: `--max-pages 15` fetched 18 pages with four workers,
+        # overshooting by exactly n_page - 1. The event loop is single
+        # threaded, so reserving here is atomic; the slot is handed back below
+        # if the fetch does not produce a page.
+        self._page_budget[vertical.name] += 1
         try:
             page = await self._fetch.get_page(url)
         except Skipped as s:
+            self._page_budget[vertical.name] -= 1
             self.stats.note_skip(s.reason)
             self._pages.complete(url)
             return
         except FetchError as e:
+            self._page_budget[vertical.name] -= 1
             self.stats.pages_failed += 1
             self.stats.note_skip(e.reason)
             self._settle(self._pages, url, e)
             return
 
-        self._page_budget[vertical.name] += 1
         self.stats.pages_fetched += 1
 
         html = page.text

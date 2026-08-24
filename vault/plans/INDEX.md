@@ -68,6 +68,12 @@ This is already a working product.
 
 ## Open questions
 
+- **The image URL is never stored.** `image` has sha1, dimensions and byte size
+  but no URL, so an image cannot be re-fetched and provenance stops at the
+  page. Storing it costs roughly one `url_path` row per image — order 1 GB at
+  10M against a 48 GB budget — so it needs an ADR, not a schema edit.
+  See [[seed-vertical-conference-speakers]].
+
 - ~~The crawl loop uses ~46% of its permitted request rate.~~ **RESOLVED — it
   was not a bug.** `configured_rate()` returns `min(global, override)`, so
   `seeds.yaml` asking for 1.0 rps against the 0.5 global default was clamped to
