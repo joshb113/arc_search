@@ -6,7 +6,7 @@
 | Plan | Status | Description |
 |------|--------|-------------|
 | [[plan-001-crawl-tier]] | 🟡 Active | Crawl tier, no model in the loop. Frontier, scope, politeness, extraction, dedup, Postgres writer — all written and tested (**233 tests**, CI green). Running against the FOSDEM archive at a measured `req_per_s=1.0`. 🔴 **Anything needed on dequeue must be IN the queue.** Image provenance lived in an in-memory dict beside the durable frontier, so a restart kept the queue and lost the context: resumed images were written with **no page link and no alt text**, silently discarding the weak labels [[plan-003-precision]] is built on. 511 images went in that way and the crawl reported perfect health throughout — caught by querying the corpus during a wrap-up, not by any test. Now `Frontier.meta`, with a restart test that goes red on the old design. 🔴 **`face_count` is tri-state** (`-1` unexamined / `0` barren / `>0` found) — it defaulted to `0`, which `Deduper` reads as *never look again*, and would have made week 2 skip the entire corpus. 🔴 **`min_image_dim` shipped at 200 and rejected 9 of 9 real speaker photos** (165–180 px); now 64, *derived* from `min_face_px`, with a test pinning the relationship. ⚠️ `--max-pages` is a per-run cap — budget-skipped URLs are `release()`d, never `complete()`d, or the frontier is consumed. Remaining: the full 13-year run and the 100k exit criterion. |
-| [[plan-002-index-and-query]] | 📋 Planned | Week 2 — Qdrant collection, Postgres `face` writer, crops, and the upload-a-photo endpoint. `FaceIndexSink` slots into the **same call site** in `run.py`, so the crawl loop does not change. `image_unexamined_idx` (partial, `face_count < 0`) is the work queue, built for this. 🔴 Landmarks and bbox are stored at **original** resolution with `src_width`/`src_height` alongside — non-negotiable #3, and eye_of_web's exact mistake. Note PDQ is still never computed: the column, the BK-tree and the tests all exist, but near-dup dedup is SHA1-only until this plan runs. |
+| [[plan-002-index-and-query]] | 🟡 Active | Week 2. **Phases 1–2 done — the engine answers a query.** The corpus is fully indexed: **1,300 faces**, Postgres + Qdrant + crops agreeing exactly, **0 unexamined, 0 tombstoned**, and 0 failures across 2,219 polite re-fetches. Identity matching works across years (143 multi-year speakers; Adam Samalik 2019→2017 at 0.667 vs best impostor 0.301). Remaining: `serve/`. Detail below — Qdrant collection (512-d, COSINE, int8, HNSW m=16), Postgres `face` writer, and crop storage, all tested (**279 tests**, green against live Postgres + Qdrant). Still **no model in the loop**; the `faces` collection is empty. 🔴 **`image.face_count` is the commit marker for BOTH stores**: `record_faces()` → Qdrant `delete_image()`/`upsert()` → `mark_examined()`. If `record_faces` ever sets the count it just wrote, a crash between the stores leaves faces no query can return and nothing reports it — three tests exist only to prevent that. 🔴 **Client/server versions are coupled**: a `>=1.9` floor let qdrant-client reach 1.19 against a pinned 1.9.2 server, leaving **no working search path in either direction** (`query_points` 404s below server 1.10; `search` was removed from the client after 1.13) — and writes succeeded throughout, so it would only have failed at the first query. Both now pinned to 1.19. ⚠️ **The bytes are gone** — nothing stores pixels, so Phase 2's backfill must re-fetch every image politely, and `REFETCH_SCHEME` assumes https because the scheme is not a stored column. ⚠️ **insightface has never been loaded on this machine** and the venv is Python 3.14 — wheel availability is the plan's biggest unknown. Measured: crops are **1,738 B** against ADR-001's 4 KB budget, putting 10M faces at **43.0 GB** vs the 49.6 GB target. Note PDQ is still never computed (`dedup.loaded pdq=0`); near-dup dedup remains SHA1-only. |
 | [[plan-003-precision]] | 📋 Planned | Weeks 3–6 — derive every threshold from a measurement. The labeled set comes free from FOSDEM's `alt="Photo of NAME"`, which the crawler already records (**40 of 40** in the first Postgres run). Then AdaFace ensemble re-rank, canonicalization at cosine > 0.92, identity clustering, scale to 1–10M. ⚠️ **The label is year-bounded: 2015–2025 carry it, 2013–2014 do not** — 11 of 13 crawled years, measured one page per year. A fresh crawl showing zero labels is probably not broken; the frontier is breadth-first and the seeds start at 2013. 🔴 `config.py`'s `t_plausible`/`t_strong`/`t_near_certain` are marked UNCALIBRATED and are placeholders — nothing should trust a result until `calibrated` flips to True from a real run. |
 | [[plan-004-scale-and-hygiene]] | 📋 Planned | Months 2–6 — TTL reaper for dead links (`page.last_checked` and its `NULLS FIRST` index exist for it), incremental recrawl, frontier → Redis, and dedup as a query rather than a startup preload (`_load_dedup` reads the whole `image` table — fine to low millions, ~1 GB of sha1 dict at 10M). |
 
@@ -20,6 +20,13 @@
 - **`url_path` interns something that never repeats.** 1:1 with `page`, so it pays a
   row and a UNIQUE index per value for zero deduplication — the same reasoning that
   sent image paths inline in [[ADR-003-store-image-urls]]. → [[plan-002-index-and-query]]
+- ~~**What should `min_face_px` be?**~~ → [[ADR-004-uncalibrated-gates-are-not-tombstones]].
+  Derived at **48** from an embedding-decay measurement, and more importantly the
+  mechanism changed: no uncalibrated threshold may write an irreversible verdict.
+- **Qdrant keeps original vectors as well as the int8 copy** — 20.5 GB against 5.1 GB
+  at 10M faces, and the largest single line in the disk budget. Total still lands at
+  43.0 GB inside the 49.6 GB target, so this is a watch item, not a problem.
+  → [[plan-002-index-and-query]]
 
 ## Resolved, kept because the reasoning is reusable
 
@@ -41,11 +48,21 @@
 - [[ADR-001-crop-only-storage]]
 - [[ADR-002-greenfield-not-fork]]
 - [[ADR-003-store-image-urls]]
+- [[ADR-004-uncalibrated-gates-are-not-tombstones]] — `min_face_px` 64 → 48, derived
+  from where the embedding stops matching itself. Adds `face_count = -2`: an
+  uncalibrated gate may not write a permanent verdict.
 
 ## Research
 
 - [[eye_of_web-audit]]
 - [[seed-vertical-conference-speakers]]
+- [[face-model-bringup]] — antelopev2 runs (49 img/s on CUDA). Three defects found,
+  two of them silent: CUDA was falling back to CPU at 1/12th speed while the log
+  said CUDA, and `min_face_px=64` discards half of all real faces.
+- [[first-index-and-calibration-preview]] — the first full index: 1,300 faces, 0
+  failures across 2,219 re-fetches, identity matching working across years. Plus a
+  calibration preview and the reason it is **not** a calibration: 66% of labeled
+  genuine pairs are the same photo re-published, which makes PDQ a prerequisite.
 
 ## Other indexes
 
