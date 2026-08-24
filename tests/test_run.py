@@ -14,7 +14,6 @@ import json
 import httpx
 import pytest
 import respx
-from tests.conftest import make_image
 
 from arc_search.config import CrawlSettings
 from arc_search.crawler.fetch import Fetcher
@@ -23,6 +22,7 @@ from arc_search.crawler.politeness import Politeness
 from arc_search.crawler.run import Crawler, MetadataSink, all_loopback, check_user_agent
 from arc_search.crawler.seeds import SeedConfig, Vertical
 from arc_search.index.dedup import Deduper
+from imagefixtures import make_image
 
 # Real encoded JPEGs. The fetch path reads image headers now, so a hand-written
 # magic-byte prefix is no longer a usable fixture. See conftest.

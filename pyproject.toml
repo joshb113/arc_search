@@ -65,7 +65,11 @@ packages = ["src/arc_search"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]          # so `pytest` works without an editable install
+# "src" so `pytest` works without an editable install. "tests" so helper
+# modules resolve under a BARE `pytest` as well as `python -m pytest` -- the
+# latter silently prepends the CWD, which hid a broken import until CI (which
+# runs bare) caught it. Run bare pytest locally to match CI.
+pythonpath = ["src", "tests"]
 addopts = "-q --strict-markers"
 asyncio_mode = "strict"                       # async tests must be marked, explicitly
 asyncio_default_fixture_loop_scope = "function"

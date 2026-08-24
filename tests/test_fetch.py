@@ -10,7 +10,6 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-from tests.conftest import make_image
 
 from arc_search.config import CrawlSettings
 from arc_search.crawler.fetch import (
@@ -25,6 +24,7 @@ from arc_search.crawler.fetch import (
     sniff_image_type,
 )
 from arc_search.crawler.politeness import Politeness
+from imagefixtures import make_image
 
 # Real encoded images. get_image() reads headers now, so a hand-written magic
 # prefix would be rejected as unreadable_header. See conftest.
