@@ -21,6 +21,18 @@ face-first is stale, not authoritative — check the ADR.
 running; the two whole-image indexes are designed and their models are proven
 ([[research/image-model-bringup]]) but **nothing is written**. The live index is
 2,828 faces and zero scene/text vectors.
+**Next:** [[plans/plan-005-whole-image-index]].
+
+🔴 **Embedding moves into the crawl loop.** plan-002's backfill re-fetches every
+image because the bytes were dropped at crawl time — fine for 2,468 faces
+(41 min), impossible for every image: **30M at 1 rps is 347 days**. The crawler
+already holds the decoded bytes; embed there, before they are discarded. The
+re-fetch backfill survives only for the 4,712 images already crawled.
+
+🔴 **Three collections, not one with named vectors.** Named vectors share a
+*point*, and the granularities differ: faces are per-FACE (2,828 points),
+scene/text are per-IMAGE (4,712). Scene and text can share; faces cannot join
+them.
 
 **GitHub:** https://github.com/joshb113/arc_search
 
@@ -158,8 +170,18 @@ minutes of CPU and ~80 MB. Distinguish by CPU time, not by count.
   a mailing-list archive with no faces and tens of thousands of pages. Carve
   those out with `deny_hosts`.
 - **Thresholds are measured, never chosen.** `min_image_dim` shipped at 200 and
-  rejected 9 of 9 real speaker photos (165–180 px). It is now 64, *derived* from
+  rejected 9 of 9 real speaker photos (165–180 px). It is now 48, *derived* from
   `min_face_px`, with a test pinning the relationship.
+  🔴 **That derivation is VOID under [[decisions/ADR-005-image-search-is-primary]].**
+  The argument was "an image shorter than the smallest acceptable *face* cannot
+  contain one" — which says nothing about the smallest image worth indexing for
+  *visual* search. `test_config.py` pins the relationship and will need to change.
+  **Re-measure it; do not just re-type the number.**
+- 🔴 **`face_count == 0` still tombstones, and must stop.** Four sites in
+  `index/dedup.py` (`:156`, `:165`, `:181`, `:194`). Correct for a face engine;
+  under an image engine it discards most of the corpus. Harmless *today* only
+  because ADR-004 means there are zero tombstones — every face-less image is
+  `-2`, so all 1,886 are still present and re-embeddable.
 - **`--max-pages` is a per-run cap, not a verdict.** Budget-skipped URLs are
   released back to PENDING; they must never be `complete()`d.
 - **Anything needed on dequeue must be IN the queue.** Image provenance lived
