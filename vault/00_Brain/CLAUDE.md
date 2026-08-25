@@ -75,6 +75,18 @@ can only **lower** that; a higher value is clamped and logged as
 `politeness.override_ignored`. Effective rate is the slowest of
 (global, vertical override, robots `Crawl-delay`).
 
+🔴 **The configured rate is ADVISORY, not what the server sees.** Buckets are
+keyed on **hostname**; `archive.fosdem.org` and `fosdem.org` resolve to the
+**same IP**, so that one box gets two budgets and sees up to 2× the configured
+rate. Same shape as `politeness.override_ignored` — the number we log is not the
+number the other end experiences. Open defect, see [[plans/plan-001-crawl-tier]].
+
+⚠️ **`--rps` on the backfill can only LOWER the global.** To go *faster* for a
+bounded one-off pass, set `ARC_CRAWL_PER_HOST_RPS` in the environment for that
+run — do not edit `.env`, or the crawler silently inherits it too. FOSDEM serves
+**no robots.txt** (404), so nothing external constrains the rate; the 1.0 is
+purely our own choice and is not a non-negotiable.
+
 **Postgres.** `docker compose up -d postgres`. The DSN carries no password —
 export `PGPASSWORD` from `ARC_PG_PASSWORD` in `.env`, which is also what Compose
 itself needs. Docker requires WSL2 on this machine.
@@ -97,6 +109,22 @@ PGPASSWORD=... .venv/Scripts/pytest.exe
 see [[research/face-model-bringup]]. `insightface` **1.0.1** (not 0.7.3, which is
 sdist-only and will not build here), antelopev2 loaded, all five models including
 `genderage`, running on CUDA at **49 img/s**. The venv still has no `fastapi`.
+
+🔴 **torch and onnxruntime bundle DIFFERENT CUDA runtimes, and load order
+decides whether both work.** onnxruntime-gpu ships CUDA **13**; torch ships
+**12.8**. Measured:
+
+```
+insightface then torch  ->  OSError WinError 127, torch cannot load
+                            torch\lib\cudnn_cnn64_9.dll
+torch then insightface  ->  both on CUDA, both keep working
+```
+
+`register_cuda_runtime()` prepending the cu13 dirs is what makes onnxruntime find
+cublasLt — and also what makes torch's cu128 cuDNN resolve against the wrong CUDA
+generation. Whichever loads first wins; already-loaded modules ignore later PATH
+changes. **It now imports torch itself**, so the ordering enforces itself. Do not
+"clean up" that import.
 
 ⏳ **insightface 1.0.1 will break on scikit-image 2.2.** Every extract emits:
 
@@ -135,6 +163,23 @@ disk image location resets to C: and this becomes a silent ceiling again.
 PGPASSWORD=... PYTHONPATH=src python -m arc_search.index.backfill [--limit N] [--rps R] [--dry-run]
 PGPASSWORD=... PYTHONPATH=src python -m arc_search.serve.app      # http://127.0.0.1:8000
 ```
+
+**Two tiers, two state columns, one fetch.** The crawl loop now embeds whole
+images itself (`EmbeddingSink`, ADR-005) but does **not** do faces:
+
+| | writes | when |
+|---|---|---|
+| scene + text | `embed_state` | in the crawl loop, from bytes already in hand |
+| faces | `face_count` | backfill only, by re-fetch |
+
+The backfill drains **both** from one queue (`pending_images`), because the
+expensive resource is the politeness budget, not the GPU. 🔴 It only queues jobs
+the run can actually do — a faces-only run (`--no-embed`) must not fetch an
+embed-pending image, do nothing, and fetch it again next run forever.
+
+⚠️ **Set `HF_HOME=data/hf-cache` for any manual run.** `conftest.py` sets it for
+tests. Unset, HuggingFace re-downloads ~1.5 GB to `~/.cache` on a C: drive at
+~97% full — that happened once and cost 700 MB.
 
 ⚠️ **Do not inspect JSON with `curl ... | python -m json.tool`.** On Windows that
 decodes the UTF-8 stream as cp1252 and re-escapes it, so a clean `è` comes back

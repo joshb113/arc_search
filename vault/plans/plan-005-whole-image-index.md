@@ -83,7 +83,7 @@ verified to 2**63-1 against the live server. So the whole-image collection needs
 payload filter, and an orphaned vector is *structurally impossible* — the point
 id and the row id are the same thing.
 
-## Phase 2 – Embedding in the crawl loop 🟡 (in-loop done; backfill remains)
+## Phase 2 – Embedding in the crawl loop ✅
 
 **Embedder + write path done 2026-08-25.** 359 tests (+4 gpu-marked, excluded by
 default). Proven end to end on real corpus images: *"a photo of a fish"* returns
@@ -110,7 +110,17 @@ bearded man; scene more-like-this from the fish scores 1.000 against ~0.01.
 - [x] Batched (default 16), with the **tail flushed on close** — without that,
       up to `batch_size-1` images per run are fetched, recorded and never
       embedded: a leak visible only as a queue that never quite empties.
-- [ ] One-off re-fetch backfill for the 4,712 already-crawled images
+- [x] **One-off re-fetch backfill — done 2026-08-25.** The corpus is fully
+      embedded: **4,753 images / 4,753 vectors**, 0 unembedded, 0 failures.
+      One queue served both tiers, and the two were disjoint: 41 images needed
+      faces (crawled after the sink existed, so already embedded) and 4,712
+      needed embedding (crawled before it, already face-examined).
+      ⚠️ Run at `ARC_CRAWL_PER_HOST_RPS=5.0` for the tail rather than 1.0.
+      FOSDEM serves **no robots.txt** (404), so the 1.0 was purely our own
+      choice, not a host requirement — and `--rps` can only *lower* the global,
+      so going faster means the env var. See the open politeness defect in
+      [[plan-001-crawl-tier]]: buckets are keyed per hostname and both FOSDEM
+      hostnames share one IP, so the server saw ~2x whatever was configured.
 - [ ] ⚠️ **Whole-image embedding has no quality gate**, unlike faces. There is no
       `too_small`/`bad_pose` equivalent — every image gets a vector. The only
       exclusion is `min_image_dim`, which is uncalibrated (below).
