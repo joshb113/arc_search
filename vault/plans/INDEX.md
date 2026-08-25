@@ -59,6 +59,10 @@
 - [[face-model-bringup]] — antelopev2 runs (49 img/s on CUDA). Three defects found,
   two of them silent: CUDA was falling back to CPU at 1/12th speed while the log
   said CUDA, and `min_face_px=64` discards half of all real faces.
+- [[image-model-bringup]] — spike for ADR-005. torch 2.11.0+cu128 on Python 3.14, sm_120
+  verified. DINOv2 **768-d / 179 img/s**, SigLIP2 **768-d / 93 img/s**, both discriminating
+  on real corpus images. Storage recomputed: **280 GB** vs **96 GB** on one config flag.
+  ⚠️ The 512-d truncation option is **withdrawn as uncosted** — n=7 could not test it.
 - [[first-index-and-calibration-preview]] — the first full index: 1,300 faces, 0
   failures across 2,219 re-fetches, identity matching working across years. Plus a
   calibration preview and the reason it is **not** a calibration: 66% of labeled

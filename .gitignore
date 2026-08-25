@@ -17,6 +17,7 @@ models/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-spike/          # throwaway model-spike env, see research/image-model-bringup
 venv/
 *.egg-info/
 .pytest_cache/

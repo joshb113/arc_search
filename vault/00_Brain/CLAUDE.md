@@ -75,6 +75,19 @@ see [[research/face-model-bringup]]. `insightface` **1.0.1** (not 0.7.3, which i
 sdist-only and will not build here), antelopev2 loaded, all five models including
 `genderage`, running on CUDA at **49 img/s**. The venv still has no `fastapi`.
 
+⏳ **insightface 1.0.1 will break on scikit-image 2.2.** Every extract emits:
+
+```
+FutureWarning: `estimate` is deprecated since version 0.26 and will be
+removed in version 2.2  -- insightface/utils/face_align.py:23
+```
+
+`face_align.py` calls `SimilarityTransform.estimate()`, which scikit-image
+removes in 2.2. Harmless today, and it is only a warning — but when that release
+lands, face **alignment** breaks, which will present as a model accuracy problem
+rather than a dependency problem. Pin `scikit-image<2.2` before upgrading
+blindly, or check whether insightface has moved to `from_estimate`.
+
 ⚠️ **antelopev2 unzips one level too deep** —
 `~/.insightface/models/antelopev2/antelopev2/*.onnx` — and `FaceAnalysis` dies on
 `assert 'detection' in self.models`. Flatten it up one level. `config.py` cites
@@ -200,10 +213,27 @@ collection is empty.
 The crawl continues in parallel (`archive-run9`), so the work queue grows while
 the index tier is built.
 
-**The engine answers a query.** The whole corpus is indexed: **1,300 faces** in
-Postgres, Qdrant and on disk, all three agreeing exactly, 0 unexamined and
-0 tombstoned. A photo goes in and the right person comes back — including the
-same person in a *different year*, across 143 multi-year speakers.
+**The engine answers a query.** The whole corpus is indexed. A photo goes in and
+the right person comes back — including the same person in a *different year*,
+across 143 multi-year speakers.
+
+**Live corpus, measured 2026-08-25** (was 1,300 faces when week 2 closed; the
+crawl and backfill kept running):
+
+| | count |
+|---|---|
+| faces, Postgres | **2,828** |
+| points, Qdrant | **2,828** ✅ agree |
+| images total | 4,712 |
+| ├ `face_count > 0` | 2,826 |
+| ├ `face_count = -2` provisional, re-examinable | **1,886** |
+| ├ `face_count = 0` tombstoned | **0** |
+| └ `face_count = -1` unexamined | 0 |
+
+⚠️ `indexed_vectors_count=0` on the Qdrant side — the collection is under the
+10,000 `indexing_threshold`, so searches are full scans. Expected at this size,
+and it means **no HNSW behaviour has ever been exercised**. Do not read current
+query latency as representative.
 
 **plan-002 is complete.** `serve/` is written and verified against the live
 index — upload a speaker photo at `http://127.0.0.1:8000`, get that speaker back
