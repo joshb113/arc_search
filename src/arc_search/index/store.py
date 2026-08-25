@@ -489,6 +489,18 @@ class PostgresWriter:
             for r in rows
         ]
 
+    def image_id_for_sha1(self, digest: bytes) -> int | None:
+        """Look up an image by its content hash.
+
+        Exists because the ``CrawlSink`` protocol returns a verdict string, not
+        an id, and the embedding sink needs the id to key its vector. One lookup
+        on a UNIQUE index, on a path that is rate-limited to 1 rps -- widening
+        the protocol to carry an id would ripple through MetadataSink and every
+        test that implements it, for a query that costs nothing here.
+        """
+        row = self._exec("SELECT id FROM image WHERE sha1 = %s", (digest,)).fetchone()
+        return row[0] if row else None
+
     def unembedded_count(self) -> int:
         row = self._exec(
             "SELECT count(*) FROM image WHERE embed_state = %s", (UNEMBEDDED,)

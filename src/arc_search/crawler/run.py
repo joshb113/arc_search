@@ -611,6 +611,12 @@ async def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--concurrency", type=int, default=None)
     ap.add_argument("--max-pages", type=int, default=None, help="override every vertical")
     ap.add_argument(
+        "--no-embed",
+        action="store_true",
+        help="skip whole-image (scene+text) embedding. The crawl still records "
+        "every image; they stay at embed_state=-1 for the backfill.",
+    )
+    ap.add_argument(
         "--sink",
         choices=("postgres", "jsonl"),
         default="postgres",
@@ -676,6 +682,25 @@ async def main(argv: list[str] | None = None) -> int:
             )
             return 2
         log.info("sink.postgres", resumed_images=sink.loaded)
+
+        # Whole-image embedding, ADR-005. Wrapped around the sink rather than
+        # built into the crawl loop, so this tier can be removed by deleting
+        # these lines -- the loop never learns that a model exists.
+        #
+        # The bytes are only in hand once (non-negotiable #1 keeps no scene
+        # images), and re-fetching all 30M later at politeness rates is 347
+        # days. So embedding happens here or it does not happen affordably.
+        #
+        # prepare() returning False means the model stack is unavailable: the
+        # crawl runs exactly as it did before and images stay at
+        # embed_state = -1 for the backfill. A GPU problem must never cost a
+        # five-hour crawl's frontier.
+        if not args.no_embed:
+            from arc_search.index.embed_sink import EmbeddingSink
+
+            embedding = EmbeddingSink(sink, writer=sink)
+            embedding.prepare()
+            sink = embedding
     else:
         sink = MetadataSink(args.out, Deduper())
         log.warning(

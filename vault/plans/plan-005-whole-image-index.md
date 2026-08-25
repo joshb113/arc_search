@@ -83,7 +83,7 @@ verified to 2**63-1 against the live server. So the whole-image collection needs
 payload filter, and an orphaned vector is *structurally impossible* — the point
 id and the row id are the same thing.
 
-## Phase 2 – Embedding in the crawl loop 🟡
+## Phase 2 – Embedding in the crawl loop 🟡 (in-loop done; backfill remains)
 
 **Embedder + write path done 2026-08-25.** 359 tests (+4 gpu-marked, excluded by
 default). Proven end to end on real corpus images: *"a photo of a fish"* returns
@@ -95,14 +95,21 @@ bearded man; scene more-like-this from the fish scores 1.000 against ~0.01.
 - [x] Named-vector collection support in `VectorStore` — `upsert_image()` /
       `search_named()`. Refuses a half-written pair, refuses a wrong dim,
       refuses an unknown vector name.
-- [ ] Scene + text embedding at the existing sink call site, from bytes already
-      in hand
-- [ ] 🔴 **A model failure must not kill the crawl.** The frontier is durable and
-      the crawl is a five-hour job; an OOM or a corrupt-image exception has to
-      leave the image re-embeddable and let the loop continue. Same lesson as
-      `backfill._process`, which catches broadly on purpose.
-- [ ] Batch across the loop — the GPU wants batches (179 img/s at batch 7 vs 70
-      at batch 1) and the crawl produces images one at a time
+- [x] **Scene + text embedding in the crawl loop** — `index/embed_sink.py`.
+      A **decorator** around the sink, not a change to the loop: `Crawler` never
+      learns a model exists, and the undo is one line in `run.py`. `--no-embed`
+      opts out.
+      ✅ Verified live: a 60-page crawl embedded **41 images, 0 failures**, at
+      `req_per_s=1.0` — **unchanged**, because at 1 rps the GPU is ~99% idle.
+      Then text-searched those 41 vectors successfully.
+- [x] 🔴 **A model failure does not kill the crawl.** Eight tests cover it: OOM,
+      Qdrant down, undecodable image, dimension mismatch, and models that will
+      not load at all. In every case the image is recorded, stays at
+      `embed_state = -1`, and the crawl continues. `prepare()` returns False
+      rather than raising, so a broken GPU degrades to the pre-ADR-005 crawl.
+- [x] Batched (default 16), with the **tail flushed on close** — without that,
+      up to `batch_size-1` images per run are fetched, recorded and never
+      embedded: a leak visible only as a queue that never quite empties.
 - [ ] One-off re-fetch backfill for the 4,712 already-crawled images
 - [ ] ⚠️ **Whole-image embedding has no quality gate**, unlike faces. There is no
       `too_small`/`bad_pose` equivalent — every image gets a vector. The only
