@@ -131,6 +131,19 @@ class UnexaminedImage:
     height: int
 
 
+@dataclass(frozen=True)
+class PendingImage(UnexaminedImage):
+    """Same, plus which jobs this image is actually waiting on.
+
+    The two tiers have separate state columns and drain independently, so an
+    image can need faces, embedding, or both. Carrying the flags means one fetch
+    serves whatever is outstanding instead of one fetch per tier.
+    """
+
+    needs_faces: bool = True
+    needs_embed: bool = True
+
+
 def path_of(url: str) -> str:
     """Everything after the host: path plus query. Never the fragment."""
     parts = urlsplit(url)
@@ -488,6 +501,64 @@ class PostgresWriter:
             )
             for r in rows
         ]
+
+    def pending_images(
+        self, limit: int = 1000, after_id: int = 0, *, faces: bool = True, embed: bool = True
+    ) -> list[PendingImage]:
+        """Images needing face examination, whole-image embedding, or both.
+
+        One queue and therefore ONE re-fetch per image. The two tiers have
+        separate state columns and drain independently, but they need the same
+        bytes, and a fetch costs a second of politeness budget while the GPU
+        work costs milliseconds. Querying them separately would re-fetch every
+        image twice for no gain.
+
+        ``faces`` / ``embed`` say which jobs this run can actually do. Both
+        matter: including an image whose only outstanding job is one the caller
+        cannot perform means fetching it, doing nothing, and fetching it again
+        next run -- forever.
+        """
+        if not faces and not embed:
+            return []
+        clauses = []
+        if faces:
+            clauses.append("i.face_count = -1")
+        if embed:
+            clauses.append("i.embed_state = -1")
+        rows = self._exec(
+            f"""
+            SELECT i.id, d.host, i.url_path, i.width, i.height,
+                   i.face_count, i.embed_state
+            FROM image i
+            JOIN domain d ON d.id = i.domain_id
+            WHERE ({" OR ".join(clauses)}) AND i.id > %s
+            ORDER BY i.id
+            LIMIT %s
+            """,
+            (after_id, limit),
+        ).fetchall()
+        return [
+            PendingImage(
+                image_id=r[0],
+                url=f"{REFETCH_SCHEME}://{r[1]}{r[2]}",
+                width=r[3],
+                height=r[4],
+                needs_faces=r[5] == UNEXAMINED,
+                needs_embed=r[6] == UNEMBEDDED,
+            )
+            for r in rows
+        ]
+
+    def pending_count(self, *, faces: bool = True, embed: bool = True) -> int:
+        if not faces and not embed:
+            return 0
+        clauses = []
+        if faces:
+            clauses.append("face_count = -1")
+        if embed:
+            clauses.append("embed_state = -1")
+        row = self._exec(f"SELECT count(*) FROM image WHERE {' OR '.join(clauses)}").fetchone()
+        return row[0] if row else 0
 
     def image_id_for_sha1(self, digest: bytes) -> int | None:
         """Look up an image by its content hash.

@@ -61,8 +61,10 @@ class FakeExtractor:
         self._per = list(per_image)
         self._rejects = rejects or FakeRejects()
         self.crops_written = []
+        self.calls = 0
 
     def extract(self, img):
+        self.calls += 1
         n = self._per.pop(0) if self._per else 0
         return [FakeFace(i + 1) for i in range(n)], self._rejects
 
@@ -352,3 +354,170 @@ async def test_every_indexed_vector_joins_back_to_postgres(writer, vectors, png,
     for point in vectors.client.scroll(vectors.name, limit=100, with_payload=True)[0]:
         assert point.payload["face_id"] in pg_ids
     assert vectors.count() == len(pg_ids) == 4
+
+
+# --- the combined queue (ADR-005) ------------------------------------------
+#
+# Faces and whole-image embedding have separate state columns and drain
+# independently, but they need the SAME bytes. The expensive resource is the
+# politeness budget -- a fetch costs a second, the GPU work costs milliseconds
+# -- so one queue serves both and each image is fetched once.
+
+
+class FakeImageVectors:
+    def __init__(self, fail=False):
+        from arc_search.config import CollectionSpec
+
+        self.spec = CollectionSpec(
+            name="images_test", dim=768, named=(("scene", 768), ("text", 768))
+        )
+        self.name = "images_test"
+        self.written: dict[int, dict] = {}
+        self.fail = fail
+
+    def ensure_collection(self):
+        return True
+
+    def verify(self):
+        return []
+
+    def upsert_image(self, image_id, vectors):
+        if self.fail:
+            raise RuntimeError("qdrant down")
+        self.written[image_id] = vectors
+
+
+class FakeImgVec:
+    def __init__(self):
+        self.scene = np.zeros(768, dtype=np.float32)
+        self.text = np.zeros(768, dtype=np.float32)
+
+
+class FakeImageEmbedder:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = 0
+
+    def dims(self):
+        return (768, 768)
+
+    def effective_device(self):
+        return "cuda:0"
+
+    def embed_images(self, images):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("CUDA OOM")
+        return [FakeImgVec() for _ in images]
+
+
+@pytest.mark.integration
+@needs_pg
+@pytest.mark.asyncio
+async def test_one_fetch_serves_both_tiers(writer, vectors, png, tmp_path):
+    """An image needing faces AND embedding must be fetched once, not twice."""
+    _seed(writer, 2, png)
+    fetcher = FakeFetcher(png)
+    iv, ie = FakeImageVectors(), FakeImageEmbedder()
+    job = _job(
+        writer, vectors, FakeExtractor([1, 1]), fetcher, tmp_path, embedder=ie, image_vectors=iv
+    )
+
+    stats = await job.run()
+
+    assert len(fetcher.requested) == 2, "each image fetched exactly once"
+    assert stats.faces_indexed == 2
+    assert stats.embedded == 2
+    assert len(iv.written) == 2
+    assert writer.face_counts()["unexamined"] == 0
+    assert writer.embed_counts()["unembedded"] == 0
+
+
+@pytest.mark.integration
+@needs_pg
+@pytest.mark.asyncio
+async def test_an_already_embedded_image_only_gets_faces(writer, vectors, png, tmp_path):
+    """The two tiers drain independently. Work already done must not be redone."""
+    ids = _seed(writer, 2, png)
+    for i in ids:
+        writer.mark_embedded(i)
+
+    iv, ie = FakeImageVectors(), FakeImageEmbedder()
+    job = _job(
+        writer,
+        vectors,
+        FakeExtractor([1, 1]),
+        FakeFetcher(png),
+        tmp_path,
+        embedder=ie,
+        image_vectors=iv,
+    )
+    stats = await job.run()
+
+    assert stats.faces_indexed == 2
+    assert stats.embedded == 0, "already embedded; must not re-embed"
+    assert ie.calls == 0
+
+
+@pytest.mark.integration
+@needs_pg
+@pytest.mark.asyncio
+async def test_an_already_face_examined_image_only_gets_embedded(writer, vectors, png, tmp_path):
+    """The 4,712-image case: face work done, embedding outstanding."""
+    ids = _seed(writer, 2, png)
+    for i in ids:
+        writer.mark_examined(i, 0)
+
+    iv, ie = FakeImageVectors(), FakeImageEmbedder()
+    ex = FakeExtractor([1, 1])
+    job = _job(writer, vectors, ex, FakeFetcher(png), tmp_path, embedder=ie, image_vectors=iv)
+    stats = await job.run()
+
+    assert stats.embedded == 2
+    assert stats.faces_indexed == 0
+    assert ex.calls == 0, "the detector must not run on an already-examined image"
+
+
+@pytest.mark.integration
+@needs_pg
+@pytest.mark.asyncio
+async def test_work_this_run_cannot_do_is_not_queued(writer, vectors, png, tmp_path):
+    """🔴 The stall this prevents: an image whose ONLY outstanding job is
+    embedding, on a faces-only run, would be fetched, do nothing, and be fetched
+    again next run -- forever, burning politeness budget for no progress."""
+    ids = _seed(writer, 2, png)
+    for i in ids:
+        writer.mark_examined(i, 0)  # faces done; only embedding outstanding
+
+    fetcher = FakeFetcher(png)
+    job = _job(writer, vectors, FakeExtractor([]), fetcher, tmp_path)  # no embedder
+    stats = await job.run()
+
+    assert stats.examined == 0
+    assert len(fetcher.requested) == 0, "fetched an image for a job it cannot do"
+    assert writer.embed_counts()["unembedded"] == 2, "still queued for a run that can"
+
+
+@pytest.mark.integration
+@needs_pg
+@pytest.mark.asyncio
+async def test_an_embed_failure_does_not_cost_the_face_work(writer, vectors, png, tmp_path):
+    """Both jobs share one fetch, so one failing must not waste the other."""
+    _seed(writer, 2, png)
+    iv, ie = FakeImageVectors(), FakeImageEmbedder(fail=True)
+    job = _job(
+        writer,
+        vectors,
+        FakeExtractor([1, 1]),
+        FakeFetcher(png),
+        tmp_path,
+        embedder=ie,
+        image_vectors=iv,
+    )
+
+    stats = await job.run()
+
+    assert stats.embed_failed == 2
+    assert stats.faces_indexed == 2, "the face work this fetch paid for still landed"
+    assert writer.face_counts()["unexamined"] == 0
+    assert writer.embed_counts()["unembedded"] == 2, "embedding stays queued"

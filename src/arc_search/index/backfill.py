@@ -72,6 +72,8 @@ class BackfillStats:
     skipped: int = 0  # robots, screening, non-200
     decode_failed: int = 0
     faces_indexed: int = 0
+    embedded: int = 0
+    embed_failed: int = 0
     rejects: dict[str, int] = field(default_factory=dict)
 
     def add_rejects(self, r) -> None:
@@ -99,6 +101,8 @@ class BackfillStats:
             f"      skipped                       {self.skipped:>8}",
             f"      undecodable                   {self.decode_failed:>8}",
             f"    faces indexed                   {self.faces_indexed:>8}",
+            f"    images embedded (scene+text)    {self.embedded:>8}",
+            f"      embed failed                  {self.embed_failed:>8}",
         ]
         if self.rejects:
             out.append("")
@@ -123,6 +127,8 @@ class Backfill:
         crop_root: Path,
         calibrated: bool = False,
         batch_size: int = 200,
+        embedder=None,
+        image_vectors=None,
     ) -> None:
         self._w = writer
         self._v = vectors
@@ -133,6 +139,18 @@ class Backfill:
         self._batch = batch_size
         self._stop = False
         self.stats = BackfillStats()
+
+        # Whole-image embedding, ADR-005. Optional so a faces-only run still
+        # works and so the 13 tests written before ADR-005 stay meaningful.
+        self._embedder = embedder
+        self._iv = image_vectors
+        self._do_embed = embedder is not None and image_vectors is not None
+
+        # Faces are ALWAYS a job this runner can do; embedding only if wired.
+        # This matters for the queue: including an image whose sole outstanding
+        # job is one we cannot perform means fetching it, doing nothing, and
+        # fetching it again next run, forever.
+        self._q = {"faces": True, "embed": self._do_embed}
 
     def stop(self) -> None:
         """Ctrl-C. Finishes the image in flight, then exits cleanly."""
@@ -174,6 +192,15 @@ class Backfill:
         if img is None:
             self.stats.decode_failed += 1
             log.warning("backfill.undecodable", image_id=item.image_id, url=item.url)
+            return
+
+        # Whole-image embedding first, from the same bytes. Isolated exactly as
+        # the crawl-loop sink is: an embedding failure must not cost the face
+        # work that this fetch also paid for.
+        if self._do_embed and getattr(item, "needs_embed", False):
+            self._embed_one(item, fetched.body)
+
+        if not getattr(item, "needs_faces", True):
             return
 
         faces, rejects = self._ex.extract(img)
@@ -220,6 +247,35 @@ class Backfill:
         self.stats.with_faces += 1
         self.stats.faces_indexed += len(faces)
 
+    def _embed_one(self, item, raw: bytes) -> None:
+        """Scene + text vectors for one image. Never raises.
+
+        Batching would be faster on paper, but this path is fetch-bound at 1 rps
+        and the GPU does 179 img/s -- buffering would add a partial-batch-on-
+        crash failure mode to save nothing. The crawl-loop sink batches because
+        it is already holding images anyway; here there is nothing to gain.
+        """
+        import io
+
+        from PIL import Image
+
+        try:
+            pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            (vec,) = self._embedder.embed_images([pil])
+            # Vectors, then the commit marker. The point id is the image id, so
+            # a crash between them leaves the image queued and a re-run
+            # overwrites rather than duplicating.
+            self._iv.upsert_image(item.image_id, {"scene": vec.scene, "text": vec.text})
+            self._w.mark_embedded(item.image_id)
+            self.stats.embedded += 1
+        except Exception as exc:
+            self.stats.embed_failed += 1
+            log.warning(
+                "backfill.embed_failed",
+                image_id=item.image_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
     # ------------------------------------------------------------------ run
 
     async def run(self, limit: int | None = None) -> BackfillStats:
@@ -227,10 +283,11 @@ class Backfill:
         if problems := self._v.verify():
             raise RuntimeError(f"qdrant collection disagrees with config: {problems}")
 
-        pending = self._w.unexamined_count()
+        pending = self._w.pending_count(**self._q)
         log.info(
             "backfill.start",
             pending=pending,
+            embedding=self._do_embed,
             limit=limit,
             calibrated=self._calibrated,
             crop_root=str(self._crop_root),
@@ -248,7 +305,7 @@ class Backfill:
         # handed back by the very next query.
         after_id = 0
         while not self._stop:
-            batch = self._w.unexamined_images(limit=self._batch, after_id=after_id)
+            batch = self._w.pending_images(limit=self._batch, after_id=after_id, **self._q)
             if not batch:
                 break
 
@@ -268,6 +325,7 @@ class Backfill:
                         "backfill.progress",
                         examined=self.stats.examined,
                         faces=self.stats.faces_indexed,
+                        embedded=self.stats.embedded,
                         with_faces=self.stats.with_faces,
                         empty=self.stats.provisional_empty + self.stats.barren,
                         failed=self.stats.fetch_failed,
@@ -321,6 +379,13 @@ async def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-size", type=int, default=200)
     ap.add_argument("--crop-dir", type=Path, default=None, help="default: face.crop_dir")
     ap.add_argument("--dry-run", action="store_true", help="report the queue and exit")
+    ap.add_argument(
+        "--no-embed",
+        action="store_true",
+        help="faces only; skip whole-image scene+text embedding. Images then "
+        "stay at embed_state=-1 and are NOT put on this run's queue, so they "
+        "are not re-fetched for a job this run cannot do.",
+    )
     args = ap.parse_args(argv)
 
     structlog.configure(processors=[structlog.dev.ConsoleRenderer()])
@@ -345,9 +410,14 @@ async def main(argv: list[str] | None = None) -> int:
     writer = PostgresWriter(index_cfg.pg_dsn)
     try:
         counts = writer.face_counts()
-        log.info("backfill.queue", **counts)
+        embed_counts = writer.embed_counts()
+        log.info("backfill.queue", **counts, **{f"embed_{k}": v for k, v in embed_counts.items()})
         if args.dry_run:
-            print(f"  pending: {counts['unexamined']}  provisional: {counts['provisional']}")
+            print(f"  faces pending: {counts['unexamined']}  provisional: {counts['provisional']}")
+            print(
+                f"  embed pending: {embed_counts['unembedded']}  "
+                f"embedded: {embed_counts['embedded']}"
+            )
             return 0
 
         log.warning(
@@ -359,6 +429,35 @@ async def main(argv: list[str] | None = None) -> int:
 
         vectors = VectorStore(index_cfg)
         extractor = FaceExtractor(face_cfg)
+
+        # Whole-image embedding shares the fetch with the face pass -- the
+        # expensive resource is the politeness budget, not the GPU.
+        embedder = image_vectors = None
+        if not args.no_embed:
+            try:
+                from arc_search.index.embed import ImageEmbedder
+                from arc_search.index.vectors import VectorStore as VS
+
+                image_vectors = VS(index_cfg, spec=index_cfg.image_spec())
+                image_vectors.ensure_collection()
+                embedder = ImageEmbedder()
+                scene_dim, text_dim = embedder.dims()
+                want = dict(index_cfg.image_spec().named)
+                if (scene_dim, text_dim) != (want["scene"], want["text"]):
+                    raise RuntimeError(
+                        f"model dims (scene={scene_dim}, text={text_dim}) do not match "
+                        f"collection {image_vectors.name} ({want})"
+                    )
+                log.info("backfill.embedding_ready", device=embedder.effective_device())
+            except Exception as exc:
+                # Degrade to faces-only rather than refusing to run. The face
+                # queue is still drainable and the images stay queued.
+                log.warning(
+                    "backfill.embedding_disabled",
+                    error=f"{type(exc).__name__}: {exc}",
+                    detail="running faces-only; images stay at embed_state=-1",
+                )
+                embedder = image_vectors = None
 
         limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
         async with httpx.AsyncClient(
@@ -373,6 +472,8 @@ async def main(argv: list[str] | None = None) -> int:
                 crop_root=crop_root,
                 calibrated=search_cfg.calibrated,
                 batch_size=args.batch_size,
+                embedder=embedder,
+                image_vectors=image_vectors,
             )
 
             loop = asyncio.get_running_loop()
@@ -384,7 +485,10 @@ async def main(argv: list[str] | None = None) -> int:
 
         print(stats.report())
         print("  corpus")
-        for k, v in writer.face_counts().items():
+        for k, v in {
+            **writer.face_counts(),
+            **{f"embed_{k}": v for k, v in writer.embed_counts().items()},
+        }.items():
             print(f"    {k:<32}{v:>8}")
         print(f"    {'vectors in qdrant':<32}{vectors.count():>8}")
         print()
