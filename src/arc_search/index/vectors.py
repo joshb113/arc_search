@@ -52,7 +52,7 @@ import numpy as np
 import structlog
 from qdrant_client import QdrantClient, models
 
-from arc_search.config import IndexSettings
+from arc_search.config import CollectionSpec, IndexSettings
 
 log = structlog.get_logger(__name__)
 
@@ -82,15 +82,34 @@ class Hit:
 
 
 class VectorStore:
-    """The faces collection. Create it, write to it, query it, count it."""
+    """One Qdrant collection. Create it, write to it, query it, count it.
 
-    def __init__(self, cfg: IndexSettings, client: QdrantClient | None = None) -> None:
+    Was *the faces collection* until ADR-005; now it is any of the three, chosen
+    by ``spec``. ``spec`` defaults to the face collection so every existing call
+    site keeps working unchanged.
+    """
+
+    def __init__(
+        self,
+        cfg: IndexSettings,
+        client: QdrantClient | None = None,
+        spec: CollectionSpec | None = None,
+    ) -> None:
         self._cfg = cfg
+        self._spec = spec if spec is not None else cfg.face_spec()
         self._client = client if client is not None else QdrantClient(url=cfg.qdrant_url)
 
     @property
+    def spec(self) -> CollectionSpec:
+        return self._spec
+
+    @property
     def name(self) -> str:
-        return self._cfg.collection
+        return self._spec.name
+
+    @property
+    def dim(self) -> int:
+        return self._spec.dim
 
     @property
     def client(self) -> QdrantClient:
@@ -107,14 +126,14 @@ class VectorStore:
         migration, and silently doing half of one is worse than refusing.
         ``verify()`` reports the mismatch instead.
         """
-        cfg = self._cfg
+        spec = self._spec
         if self._client.collection_exists(self.name):
             return False
 
         self._client.create_collection(
             self.name,
             vectors_config=models.VectorParams(
-                size=cfg.vector_dim,
+                size=spec.dim,
                 distance=models.Distance.COSINE,
                 # Originals stay on disk; the int8 copy in RAM is what gets
                 # searched. At 10M faces the originals are ~20 GB and the
@@ -133,8 +152,8 @@ class VectorStore:
                 )
             ),
             hnsw_config=models.HnswConfigDiff(
-                m=cfg.hnsw_m,
-                ef_construct=cfg.hnsw_ef_construct,
+                m=spec.hnsw_m,
+                ef_construct=spec.hnsw_ef_construct,
             ),
         )
         # Required for delete_image to be a filtered delete rather than a scan.
@@ -146,8 +165,8 @@ class VectorStore:
         log.info(
             "vectors.collection_created",
             collection=self.name,
-            dim=cfg.vector_dim,
-            m=cfg.hnsw_m,
+            dim=spec.dim,
+            m=spec.hnsw_m,
         )
         return True
 
@@ -165,8 +184,8 @@ class VectorStore:
         info = self._client.get_collection(self.name)
         params = info.config.params.vectors
         problems: list[str] = []
-        if getattr(params, "size", None) != self._cfg.vector_dim:
-            problems.append(f"vector_dim: config={self._cfg.vector_dim} live={params.size}")
+        if getattr(params, "size", None) != self._spec.dim:
+            problems.append(f"vector_dim: config={self._spec.dim} live={params.size}")
         if getattr(params, "distance", None) != models.Distance.COSINE:
             problems.append(f"distance: expected COSINE live={params.distance}")
         return problems
@@ -175,13 +194,13 @@ class VectorStore:
 
     def _point(self, rec: VectorRecord) -> models.PointStruct:
         emb = np.asarray(rec.embedding, dtype=np.float32).reshape(-1)
-        if emb.shape != (self._cfg.vector_dim,):
+        if emb.shape != (self._spec.dim,):
             # Loud, not skipped. A wrong-shaped embedding means the model pack
             # is not what config says it is, and every vector already written
             # is suspect.
             raise ValueError(
                 f"embedding for face {rec.face_id} has shape {emb.shape}, "
-                f"expected ({self._cfg.vector_dim},)"
+                f"expected ({self._spec.dim},)"
             )
         return models.PointStruct(
             id=str(rec.qdrant_id),
@@ -241,10 +260,8 @@ class VectorStore:
         placeholders until arc_search.eval.calibrate has run. Non-negotiable #5.
         """
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
-        if emb.shape != (self._cfg.vector_dim,):
-            raise ValueError(
-                f"query embedding has shape {emb.shape}, expected ({self._cfg.vector_dim},)"
-            )
+        if emb.shape != (self._spec.dim,):
+            raise ValueError(f"query embedding has shape {emb.shape}, expected ({self._spec.dim},)")
 
         excluded = [str(u) for u in exclude]
         flt = models.Filter(must_not=[models.HasIdCondition(has_id=excluded)]) if excluded else None
@@ -255,7 +272,7 @@ class VectorStore:
             limit=limit if limit is not None else 100,
             query_filter=flt,
             search_params=models.SearchParams(
-                hnsw_ef=self._cfg.search_ef,
+                hnsw_ef=self._spec.search_ef,
                 # Rescore against the on-disk originals. Without this the
                 # ranking is decided by the int8 approximation, which is a
                 # meaningful accuracy loss exactly at the low-similarity end.

@@ -16,6 +16,7 @@ Every tunable lives here. Two rules:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import Field
@@ -157,12 +158,56 @@ class FaceSettings(BaseSettings):
     batch_size: int = 32
 
 
+@dataclass(frozen=True)
+class CollectionSpec:
+    """One Qdrant collection. arc_search has three; see ADR-005.
+
+    Split out because ``IndexSettings`` used to describe exactly one collection
+    (``collection`` + ``vector_dim``) and now has to describe three with
+    different dimensions and different point identities.
+
+    ``point_id`` is the structural difference and it is not cosmetic:
+
+      ``uuid``      one point per FACE. An image with three faces makes three
+                    points, so the id cannot be the image id and ``face.qdrant_id``
+                    exists to map them back.
+      ``image_id``  one point per IMAGE. The Postgres ``image.id`` IS the point
+                    id -- verified against a live Qdrant, including 2**63-1 --
+                    so no mapping table is needed, deletion is by id rather than
+                    by payload filter, and an orphaned vector is structurally
+                    impossible because the id and the row are the same thing.
+    """
+
+    name: str
+    dim: int
+    hnsw_m: int = 16
+    hnsw_ef_construct: int = 200
+    search_ef: int = 256
+    point_id: str = "uuid"  # "uuid" | "image_id"
+
+
 class IndexSettings(BaseSettings):
     model_config = _cfg("ARC_INDEX_")
 
     qdrant_url: str = "http://127.0.0.1:6333"
+
+    # The FACE collection. Named without a prefix for historical reasons -- these
+    # are bound to ARC_INDEX_COLLECTION / ARC_INDEX_VECTOR_DIM and predate there
+    # being more than one collection. Use `spec("faces")` rather than reading
+    # them directly in new code.
     collection: str = "faces"
     vector_dim: int = 512
+
+    # The whole-image collection: scene and text vectors as NAMED VECTORS on one
+    # point. They share a collection because both are per-image, so they share a
+    # point identity. Faces cannot join them -- different granularity, see
+    # CollectionSpec.point_id and plan-005.
+    image_collection: str = "images"
+    # 768 is MEASURED, not assumed: facebook/dinov2-base and
+    # google/siglip2-base-patch16-384 are both 768-d.
+    # See vault/research/image-model-bringup.md.
+    scene_dim: int = 768
+    text_dim: int = 768
 
     # int8 scalar, NOT binary. Face embeddings tolerate binarization far worse
     # than CLIP does, and the recall it costs lands precisely on the hard,
@@ -179,6 +224,33 @@ class IndexSettings(BaseSettings):
         default="postgresql://arc@127.0.0.1:5432/arc_search",
         description="Password comes from PGPASSWORD or .pgpass, never the DSN.",
     )
+
+    def face_spec(self) -> CollectionSpec:
+        return CollectionSpec(
+            name=self.collection,
+            dim=self.vector_dim,
+            hnsw_m=self.hnsw_m,
+            hnsw_ef_construct=self.hnsw_ef_construct,
+            search_ef=self.search_ef,
+            point_id="uuid",
+        )
+
+    def image_spec(self) -> CollectionSpec:
+        """Scene + text share this collection as named vectors.
+
+        ``dim`` is the SCENE dimension; the text vector's size is carried
+        separately by ``text_dim`` and applied by the vector store when it
+        creates the named-vector config. They are both 768 today, and writing
+        that as one number would hide the day they diverge.
+        """
+        return CollectionSpec(
+            name=self.image_collection,
+            dim=self.scene_dim,
+            hnsw_m=self.hnsw_m,
+            hnsw_ef_construct=self.hnsw_ef_construct,
+            search_ef=self.search_ef,
+            point_id="image_id",
+        )
 
 
 class SearchSettings(BaseSettings):

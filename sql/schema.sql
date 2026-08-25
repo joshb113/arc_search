@@ -98,8 +98,34 @@ CREATE TABLE IF NOT EXISTS image (
     face_count SMALLINT NOT NULL DEFAULT -1,
     CONSTRAINT face_count_valid CHECK (face_count >= -2),
 
+    -- Whole-image embedding state (scene + text), ADR-005. SEPARATE from
+    -- face_count on purpose: that column answers "how many faces does this
+    -- image have", and an image can be face-examined without being embedded or
+    -- the reverse. Overloading it would put two meanings in one column, which
+    -- is exactly how face_count's own tri-state went wrong.
+    --
+    --   -2  skipped by an UNCALIBRATED gate  => re-examine after calibration
+    --   -1  not yet embedded                 (the crawl tier writes this)
+    --    1  embedded; scene and text vectors exist in the `images` collection
+    --
+    -- There is deliberately no 0. face_count uses 0 for "examined, found
+    -- nothing", and a reader who has just learned that would read 0 here as
+    -- failure rather than success. Skipping the value costs nothing and removes
+    -- the ambiguity.
+    --
+    -- -2 exists for the same reason it does on face_count (ADR-004): the only
+    -- gate that can exclude an image from embedding is min_image_dim, which is
+    -- UNCALIBRATED -- and ADR-005 voided the derivation it used to have. No
+    -- uncalibrated gate may write an irreversible verdict.
+    embed_state SMALLINT NOT NULL DEFAULT -1,
+    CONSTRAINT embed_state_valid CHECK (embed_state IN (-2, -1, 1)),
+
     first_seen TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Work queue for the whole-image embedding pass. Partial, like the face one.
+CREATE INDEX IF NOT EXISTS image_unembedded_idx ON image (id) WHERE embed_state = -1;
+-- Re-embed queue: skipped under an uncalibrated min_image_dim.
+CREATE INDEX IF NOT EXISTS image_embed_provisional_idx ON image (id) WHERE embed_state = -2;
 -- Work queue for the indexing pass: images no detector has ever seen.
 -- Deliberately `= -1`, not `< 0`: -2 means "already examined, awaiting
 -- calibration", and including it would make every backfill run re-fetch and

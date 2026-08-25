@@ -68,6 +68,23 @@ UNEXAMINED = -1
 # numbers irreversible; -2 costs one re-fetch later and keeps the option open.
 PROVISIONAL_EMPTY = -2
 
+# ---- image.embed_state (ADR-005) -----------------------------------------
+# Whole-image scene+text embedding. A SEPARATE column from face_count, because
+# that one answers "how many faces does this image have" and an image can be
+# face-examined without being embedded or the reverse.
+UNEMBEDDED = -1
+EMBEDDED = 1
+
+# Reserved, and deliberately allowed by the CHECK constraint before anything
+# writes it. There is no embed-time quality gate today -- min_image_dim is
+# applied at CRAWL time, so every row in `image` has already passed it, and the
+# only outcomes are embedded or not-yet. But plan-005 Phase 3 re-measures
+# min_image_dim for *visual* search, and ADR-005 voided the derivation it had.
+# When that gate arrives it will be uncalibrated, and ADR-004's rule applies: no
+# uncalibrated gate may write an irreversible verdict. Widening a CHECK
+# constraint on a 30M-row table is expensive; allowing the value now is free.
+EMBED_PROVISIONAL = -2
+
 # Scheme is not a stored column -- `image` keeps an interned host plus an inline
 # path, and nothing else (ADR-003). Re-fetching therefore has to assume one, and
 # https is the assumption: an http-only host redirects, while guessing http at an
@@ -434,6 +451,74 @@ class PostgresWriter:
             "SELECT count(*) FROM image WHERE face_count = %s", (PROVISIONAL_EMPTY,)
         ).fetchone()
         return row[0] if row else 0
+
+    # -- whole-image embedding (ADR-005) -----------------------------------
+
+    def unembedded_images(self, limit: int = 1000, after_id: int = 0) -> list[UnexaminedImage]:
+        """Images with no scene/text vectors yet.
+
+        Backed by ``image_unembedded_idx``. Same keyset rule as
+        ``unexamined_images`` and for the same reason: rows leave the queue as
+        they are processed, so an OFFSET walk over a shrinking result set skips
+        work silently.
+
+        ⚠️ This queue exists for the **one-off backfill over already-crawled
+        images**. It is not the pipeline. plan-005 moves embedding into the
+        crawl loop, because re-fetching every image at 1 rps is 347 days at the
+        30M scale target -- the bytes have to be embedded while the crawler
+        still has them.
+        """
+        rows = self._exec(
+            """
+            SELECT i.id, d.host, i.url_path, i.width, i.height
+            FROM image i
+            JOIN domain d ON d.id = i.domain_id
+            WHERE i.embed_state = %s AND i.id > %s
+            ORDER BY i.id
+            LIMIT %s
+            """,
+            (UNEMBEDDED, after_id, limit),
+        ).fetchall()
+        return [
+            UnexaminedImage(
+                image_id=r[0],
+                url=f"{REFETCH_SCHEME}://{r[1]}{r[2]}",
+                width=r[3],
+                height=r[4],
+            )
+            for r in rows
+        ]
+
+    def unembedded_count(self) -> int:
+        row = self._exec(
+            "SELECT count(*) FROM image WHERE embed_state = %s", (UNEMBEDDED,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def mark_embedded(self, image_id: int) -> None:
+        """Commit: this image's scene and text vectors are in Qdrant.
+
+        Written LAST, after the vectors land, exactly like ``mark_examined``.
+        ``embed_state`` is the commit marker for the image collection, so a
+        crash before it leaves the image on the queue and a re-run converges --
+        the upsert is by ``image_id`` as the point id, so it overwrites rather
+        than duplicating.
+        """
+        self._exec("UPDATE image SET embed_state = %s WHERE id = %s", (EMBEDDED, image_id))
+
+    def embed_counts(self) -> dict[str, int]:
+        row = self._exec(
+            """
+            SELECT count(*) FILTER (WHERE embed_state = -1),
+                   count(*) FILTER (WHERE embed_state = 1),
+                   count(*) FILTER (WHERE embed_state = -2)
+            FROM image
+            """
+        ).fetchone()
+        assert row is not None
+        return {"unembedded": row[0], "embedded": row[1], "provisional": row[2]}
+
+    # -- faces ---------------------------------------------------------------
 
     def record_faces(self, image_id: int, records: Sequence[FaceRecord]) -> list[int]:
         """Replace this image's face rows. Returns the new ids, in order.

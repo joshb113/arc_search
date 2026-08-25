@@ -45,7 +45,7 @@ throws, and the crawl must survive a model failure without losing the frontier.
 
 ---
 
-## Phase 1 – Collections and schema ⬜
+## Phase 1 – Collections and schema ✅
 
 **Three collections, not one with named vectors.** ADR-005 left this open;
 measurement closes it. Qdrant's named vectors put several vectors on **one
@@ -61,18 +61,27 @@ Faces cannot share points with scene/text. Scene and text *could* share a
 collection via named vectors, since both are per-image — worth doing, since it
 halves point overhead and keeps their payloads in step.
 
-- [ ] `IndexSettings` grows from one `collection`/`vector_dim` to a per-collection
-      config. Today both are scalars and `VectorStore` reads them directly.
-- [ ] `VectorStore` becomes multi-collection, or is instantiated per collection.
-      ⚠️ `ensure_collection()` **deliberately refuses** to reconcile a changed dim
-      against a populated collection — correct, and it means this is a migration
-      to design, not a config edit.
-- [ ] Both new collections keep **float32 originals + int8**, per ADR-005's
-      storage decision. `rescore=True` stays.
-- [ ] 🔴 **`image` needs its own embedding state column.** `face_count` tracks
-      face examination and must not be overloaded — that is two meanings in one
-      column and the tri-state history says how that ends. A separate
-      `embed_state` with the same discipline ADR-004 established.
+**Done 2026-08-25.** 342 tests (was 327), lint clean, no model involved.
+
+- [x] `CollectionSpec` in `config.py`; `IndexSettings.face_spec()` /
+      `.image_spec()`. `collection`/`vector_dim` stay bound to their existing
+      env vars so every pre-ADR-005 call site is untouched.
+- [x] `VectorStore(cfg, client, spec=None)` — defaults to the face collection.
+      Dimension validation now follows the **spec**, not the global config; a
+      test pins that a 768-d scene vector is not accepted against the face 512.
+- [x] Both keep float32 originals + int8 (`rescore=True`), per ADR-005.
+- [x] `image.embed_state` + two partial indexes, migrated on both databases.
+      `-1` unembedded / `1` embedded / `-2` reserved. **No 0** — `face_count`
+      uses 0 for *examined, found nothing*, so a reader would read 0 here as
+      failure rather than success.
+- [x] `unembedded_images()` / `unembedded_count()` / `mark_embedded()` /
+      `embed_counts()`, keyset-paginated like the face queue.
+
+**Measured while building it:** `image_id` works directly as a Qdrant point id,
+verified to 2**63-1 against the live server. So the whole-image collection needs
+**no mapping table** (unlike `face.qdrant_id`), deletion is by id rather than a
+payload filter, and an orphaned vector is *structurally impossible* — the point
+id and the row id are the same thing.
 
 ## Phase 2 – Embedding in the crawl loop ⬜
 
