@@ -1,15 +1,26 @@
 # arc_search – Brain Stem (CLAUDE.md)
 
 ## Project
-**arc_search** is a self-hosted face search engine that:
+**arc_search** is a self-hosted **image search engine** that:
 1. Crawls a **bounded** set of domains you choose — not the open web, not scraped
    from anyone else's search engine
-2. Detects and embeds every qualifying face with InsightFace `antelopev2` (R100)
-3. Indexes 512-d ArcFace embeddings in Qdrant with int8 quantization
-4. Serves search-by-uploaded-photo, re-ranked and clustered by identity
+2. Embeds **every** image for text→image and scene→scene search, and every
+   qualifying face with InsightFace `antelopev2` (R100)
+3. Indexes those in Qdrant with int8 quantization plus float32 originals
+4. Serves search by text, by image, and by uploaded photo
 
-**Goal:** Yandex-class face search where the corpus and the query both stay on
+**Goal:** Yandex-class image search where the corpus and the query both stay on
 your hardware.
+
+🔴 **This changed on 2026-08-25.** It was a *face* search engine for two days;
+[[decisions/ADR-005-image-search-is-primary]] made image search primary and face
+similarity one mode of it. Anything in this file or in `plans/` that still reads
+face-first is stale, not authoritative — check the ADR.
+
+**Status: the code has not caught up yet.** The face tier is complete and
+running; the two whole-image indexes are designed and their models are proven
+([[research/image-model-bringup]]) but **nothing is written**. The live index is
+2,828 faces and zero scene/text vectors.
 
 **GitHub:** https://github.com/joshb113/arc_search
 
@@ -99,6 +110,12 @@ the full build shadows the headless one.
 
 **Qdrant.** `docker compose up -d qdrant`, HTTP on 6333. Collection `faces`,
 created by `VectorStore.ensure_collection()`.
+
+🔴 **Docker's disk lives on `F:\DockerDesktopWSL`, not C:.** Moved 2026-08-25.
+`qdrant_data` and `pg_data` are *named volumes* inside the WSL2 VM disk, which
+defaults to `C:` — and C: had 9.8 GB free against a 280 GB target. After the move:
+**954 GB free at `/qdrant/storage`**. If Docker is ever reinstalled or reset, the
+disk image location resets to C: and this becomes a silent ceiling again.
 
 **Running the backfill, and the UI.**
 

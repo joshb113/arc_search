@@ -1,8 +1,10 @@
 # ADR-005 — Image search is primary; face search is one mode of it
 
-**Status:** 🟡 Proposed · **Date:** 2026-08-25
+**Status:** ✅ Accepted, 2026-08-25 · **Date:** 2026-08-25
 **Amends:** [[ADR-001-crop-only-storage]] (partially reverses)
-**Touches:** root `CLAUDE.md` non-negotiables #1 and #4, and the scale target
+**Amends:** root `CLAUDE.md` — non-negotiables #1 and #4, and the scale target
+**Prerequisite:** Docker's disk image must move to F: before indexing at scale
+(see *Storage policy* below)
 
 ## Context
 
@@ -132,9 +134,53 @@ improve separation was noise. **It may still be the right answer — it is simpl
 uncosted, and quoting a number for it would be inventing one.**
 
 **So the scale target is a decision, not a derivation: 96 GB or 280 GB, on one
-config flag.** The cheap option is ~1.9× the current 49.6 GB target; the
-expensive one is ~5.6×. The root `CLAUDE.md` number cannot be updated until this
-is settled.
+config flag.**
+
+### Storage policy: A — keep the originals. New target 280 GB.
+
+**Decided 2026-08-25.** The two whole-image collections are configured exactly as
+`faces` is today: `on_disk=True` float32 originals **plus** the int8 copy, with
+`rescore=True` on search.
+
+The reasoning is the one ADR-001 used for faces, applied consistently: int8
+quantization loses recall, and rescoring against the originals recovers it. The
+alternative saves 184 GB by betting that whole-image retrieval tolerates
+quantization better than face retrieval does — and **nobody has measured that**.
+Buying 184 GB with an unmeasured assumption is the trade this project refuses
+everywhere else (non-negotiable #5). Disk is the cheap resource here; a silently
+degraded index is not.
+
+This is reversible in the cheap direction. Turning originals **off** later is a
+config change plus a re-index. Discovering you need them after building on
+quantized-only would mean re-embedding 30M images.
+
+### ✅ Prerequisite satisfied — Docker's disk moved to F:
+
+`qdrant_data` and `pg_data` are Docker *named volumes*, so they live inside the
+WSL2 VM disk, which defaults to `C:`. Measured 2026-08-25 **before** the move:
+
+```
+C:\Users\<user>\AppData\Local\Docker\wsl\disk\docker_data.vhdx   3.7 GB
+C: free  9.8 GB          F: free  504 GB
+```
+
+280 GB of vectors cannot land on a disk with 9.8 GB free, and Postgres was in the
+same volume. **Relocated to `F:\DockerDesktopWSL`** via Docker Desktop → Settings
+→ Resources → Advanced → *Disk image location*, which keeps native ext4
+performance inside the VM. A Windows→WSL2 bind mount was considered and rejected:
+the 9p/virtiofs layer is a poor fit for a vector store's random I/O.
+
+Verified after the move — nothing was lost, and all three stores still agree:
+
+| | |
+|---|---|
+| Qdrant `points_count` | 2,828 |
+| Postgres `face` rows | 2,828 |
+| crop files on disk | 2,828 |
+| images / pages | 4,712 / 9,363 |
+| **free at `/qdrant/storage`** | **954 GB** |
+
+954 GB against a 280 GB target is 3.4× headroom.
 
 What has *not* changed is the property the target was protecting: no option here
 stores whole-scene pixels, and option C still fits a laptop SSD.
@@ -195,10 +241,11 @@ a `research/` note like [[face-model-bringup]] rather than being assumed to work
 
 ## Open — blocking
 
-- 🔴 **Qdrant vector-storage policy for the two new collections** (options A/B/C
-  above). This is a 4× swing in total disk and the single largest open number in
-  the project. The root `CLAUDE.md` scale target stays at 49.6 GB — and therefore
-  stays *wrong* — until it is answered.
+- ~~🔴 **Qdrant vector-storage policy for the two new collections**~~
+  **DECIDED 2026-08-25: option A, keep the originals, target 280 GB.** See
+  *Storage policy* above. Root `CLAUDE.md` updated in the same commit.
+  ✅ Its prerequisite is met: Docker's disk moved to `F:\DockerDesktopWSL`,
+  954 GB free at `/qdrant/storage`, all 2,828 vectors intact across the move.
 - ~~🔴 **Do the models run here at all?**~~ **ANSWERED 2026-08-25** →
   [[research/image-model-bringup]]. Yes, in a separate venv: torch
   **2.11.0+cu128** on Python 3.14, **sm_120** confirmed by a real GPU matmul.

@@ -70,7 +70,9 @@ Re-measured on **1,300 real crops** after the backfill: mean **1,921 B**
 | crops | 19.2 GB |
 | Qdrant int8 (RAM) | 5.1 GB |
 | Qdrant originals (disk) | 20.5 GB |
-| **total** | **44.8 GB** vs the 49.6 GB target |
+| **total** | **44.8 GB** vs the then-current 49.6 GB target |
+
+⚠️ That target was **raised to 280 GB** by [[ADR-005-image-search-is-primary]] on 2026-08-25. The 44.8 GB measurement is still correct — it is the *face* tier at 10M faces. It is now roughly one sixth of the budget, not the whole of it.
 
 ~4.8 GB left for Postgres metadata. The budget holds on measured data.
 
