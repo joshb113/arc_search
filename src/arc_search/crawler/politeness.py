@@ -121,6 +121,9 @@ class Politeness:
         # bare hostname, because one machine answers all of its ports.
         self._hosts: dict[str, _HostState] = {}
         self._buckets: dict[str, TokenBucket] = {}
+        # hostname -> resolved server key. One entry per host for the
+        # life of the process; DNS is not re-checked mid-crawl.
+        self._server_keys: dict[str, str] = {}
         # Per-host overrides, from Vertical.per_host_rps. Matched by suffix, so
         # an entry for example.com also governs static.example.com.
         self._host_rps = dict(host_rps or {})
@@ -166,18 +169,75 @@ class Politeness:
             self._hosts[key] = st
         return st
 
-    def _bucket(self, hostname: str, rate: float) -> TokenBucket:
-        """One rate budget per HOSTNAME, even across ports and schemes.
+    async def server_key(self, hostname: str) -> str:
+        """The MACHINE a hostname resolves to. Cached for the process.
+
+        🔴 The rate budget belongs to the server, and a hostname is only a proxy
+        for one. Measured 2026-08-25:
+
+            archive.fosdem.org -> 2600:1702:8247:e10::1
+            fosdem.org         -> 2600:1702:8247:e10::1
+
+        Two names, one box, and -- before this -- two independent budgets. That
+        server was quietly receiving up to 2x the configured rate whenever a run
+        touched both, which is most of the time. It is the same defect the
+        docstring below already argues against for ports and schemes; the
+        argument simply was not carried one step further, to aliases.
+
+        The failure mode is invisible from inside the process, which is what
+        makes it worth resolving rather than declaring: a `seeds.yaml` alias list
+        only catches what somebody remembered, and nobody remembers a CDN.
+
+        ⚠️ Round-robin DNS and CDNs make this imperfect in the other direction:
+        several unrelated sites behind one address will share a budget and be
+        crawled slower than necessary. That is the safe way to be wrong. Erring
+        toward over-sharing costs us time; erring toward under-sharing costs
+        somebody else their server.
+
+        Falls back to the hostname when resolution fails, which is exactly the
+        old behaviour -- a DNS hiccup must not stop a crawl.
+        """
+        cached = self._server_keys.get(hostname)
+        if cached is not None:
+            return cached
+
+        key = hostname
+        try:
+            loop = asyncio.get_running_loop()
+            infos = await loop.getaddrinfo(hostname, None)
+            addrs = sorted({info[4][0] for info in infos})
+            if addrs:
+                # First of the sorted set, so a multi-homed host is stable
+                # within a run even though the resolver may reorder.
+                key = addrs[0]
+        except Exception as exc:
+            log.debug("politeness.resolve_failed", host=hostname, error=type(exc).__name__)
+
+        if key != hostname and key in self._server_keys.values():
+            shared = [h for h, k in self._server_keys.items() if k == key]
+            log.info(
+                "politeness.shared_server",
+                host=hostname,
+                shares_with=shared,
+                server=key,
+                detail="one rate budget covers all of these; they are one machine",
+            )
+        self._server_keys[hostname] = key
+        return key
+
+    def _bucket(self, server: str, rate: float) -> TokenBucket:
+        """One rate budget per SERVER, across hostnames, ports and schemes.
 
         robots.txt is per (scheme, host, port) -- but the machine answering
         those requests is one machine. Giving http://h:80 and https://h:8443
         a bucket each would hand a single server double the traffic we promised
-        it. When two authorities on one host disagree, the slower rate wins.
+        it, and so would giving two DNS names for the same box a bucket each.
+        When two authorities on one server disagree, the slower rate wins.
         """
-        bucket = self._buckets.get(hostname)
+        bucket = self._buckets.get(server)
         if bucket is None:
             bucket = TokenBucket(rate, self._cfg.per_host_burst)
-            self._buckets[hostname] = bucket
+            self._buckets[server] = bucket
         else:
             bucket.tighten(rate)
         return bucket
@@ -234,7 +294,7 @@ class Politeness:
                         # requires is never something to override.
                         rate = min(rate, 1.0 / float(delay))
 
-            st.limiter = self._bucket(hostname, rate)
+            st.limiter = self._bucket(await self.server_key(hostname), rate)
             st.fetched = True
             return st
 

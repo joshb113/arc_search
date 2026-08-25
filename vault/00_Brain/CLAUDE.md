@@ -75,11 +75,13 @@ can only **lower** that; a higher value is clamped and logged as
 `politeness.override_ignored`. Effective rate is the slowest of
 (global, vertical override, robots `Crawl-delay`).
 
-🔴 **The configured rate is ADVISORY, not what the server sees.** Buckets are
-keyed on **hostname**; `archive.fosdem.org` and `fosdem.org` resolve to the
-**same IP**, so that one box gets two budgets and sees up to 2× the configured
-rate. Same shape as `politeness.override_ignored` — the number we log is not the
-number the other end experiences. Open defect, see [[plans/plan-001-crawl-tier]].
+✅ **Rate budgets are keyed on the SERVER, not the hostname** (fixed 2026-08-25).
+`Politeness.server_key()` resolves once per process and buckets by address, so
+`archive.fosdem.org` and `fosdem.org` — one box — share one budget instead of
+getting two. Before this that server saw up to 2× the configured rate.
+⚠️ Unrelated sites behind one address now share a budget and crawl slower than
+necessary. That is the safe way to be wrong. ⚠️ Resolution failure falls back to
+the hostname, which is the old behaviour.
 
 ⚠️ **`--rps` on the backfill can only LOWER the global.** To go *faster* for a
 bounded one-off pass, set `ARC_CRAWL_PER_HOST_RPS` in the environment for that

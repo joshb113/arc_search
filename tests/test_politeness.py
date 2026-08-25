@@ -248,3 +248,127 @@ def test_requests_are_counted_at_the_rate_limiter():
     question unreadable in the first place."""
     p = Politeness(cfg(), None)  # type: ignore[arg-type]
     assert p.requests_made == 0
+
+
+# --- one budget per SERVER, not per hostname -------------------------------
+#
+# 🔴 The rate budget belongs to the machine; a hostname is only a proxy for one.
+# Measured on the live corpus 2026-08-25:
+#
+#     archive.fosdem.org -> 2600:1702:8247:e10::1
+#     fosdem.org         -> 2600:1702:8247:e10::1
+#
+# Two names, one box, and two independent budgets -- so that server was
+# receiving up to 2x the configured rate whenever a run touched both, which was
+# most of the time. Same defect the port/scheme sharing already guarded against;
+# the argument just was not carried as far as aliases.
+
+
+def _fake_resolver(mapping):
+    """Patch getaddrinfo so these tests need no DNS and no network."""
+
+    async def getaddrinfo(host, port, *a, **kw):
+        if host not in mapping:
+            raise OSError(f"no such host {host}")
+        return [(None, None, None, "", (mapping[host], 0))]
+
+    return getaddrinfo
+
+
+@pytest.mark.asyncio
+async def test_two_hostnames_on_one_server_share_a_budget(monkeypatch):
+    """The FOSDEM case, exactly."""
+    import asyncio as _asyncio
+
+    cfg = CrawlSettings(respect_robots=False)
+    async with httpx.AsyncClient() as client:
+        pol = Politeness(cfg, client)
+        loop = _asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "getaddrinfo",
+            _fake_resolver({"archive.fosdem.org": "2600::1", "fosdem.org": "2600::1"}),
+        )
+        a = await pol.server_key("archive.fosdem.org")
+        b = await pol.server_key("fosdem.org")
+        assert a == b == "2600::1"
+
+        # ...and therefore ONE bucket, not two.
+        pol._bucket(a, 1.0)
+        pol._bucket(b, 1.0)
+        assert len(pol._buckets) == 1, "one server must not get two rate budgets"
+
+
+@pytest.mark.asyncio
+async def test_distinct_servers_keep_distinct_budgets(monkeypatch):
+    """Sharing must not go too far the other way: unrelated hosts on different
+    machines still get their own budget, or a broad crawl serialises."""
+    import asyncio as _asyncio
+
+    cfg = CrawlSettings(respect_robots=False)
+    async with httpx.AsyncClient() as client:
+        pol = Politeness(cfg, client)
+        loop = _asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop, "getaddrinfo", _fake_resolver({"a.test": "10.0.0.1", "b.test": "10.0.0.2"})
+        )
+        pol._bucket(await pol.server_key("a.test"), 1.0)
+        pol._bucket(await pol.server_key("b.test"), 1.0)
+        assert len(pol._buckets) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_dns_failure_falls_back_to_the_hostname(monkeypatch):
+    """A resolver hiccup must not stop a five-hour crawl. Falling back to the
+    hostname is exactly the old behaviour -- no worse, never an exception."""
+    import asyncio as _asyncio
+
+    cfg = CrawlSettings(respect_robots=False)
+    async with httpx.AsyncClient() as client:
+        pol = Politeness(cfg, client)
+        loop = _asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "getaddrinfo", _fake_resolver({}))
+        assert await pol.server_key("unresolvable.test") == "unresolvable.test"
+
+
+@pytest.mark.asyncio
+async def test_resolution_happens_once_per_host(monkeypatch):
+    """DNS is not re-checked mid-crawl. A lookup per request would add latency
+    to every fetch and could silently re-key a bucket half way through a run."""
+    import asyncio as _asyncio
+
+    calls = []
+
+    async def counting(host, port, *a, **kw):
+        calls.append(host)
+        return [(None, None, None, "", ("10.0.0.9", 0))]
+
+    cfg = CrawlSettings(respect_robots=False)
+    async with httpx.AsyncClient() as client:
+        pol = Politeness(cfg, client)
+        monkeypatch.setattr(_asyncio.get_running_loop(), "getaddrinfo", counting)
+        for _ in range(5):
+            await pol.server_key("h.test")
+        assert calls == ["h.test"]
+
+
+@pytest.mark.asyncio
+async def test_a_multi_homed_host_is_stable_within_a_run(monkeypatch):
+    """Round-robin DNS returns addresses in varying order. Keying on the sorted
+    first means the bucket does not move under the crawl."""
+    import asyncio as _asyncio
+
+    order = [["10.0.0.3", "10.0.0.1"], ["10.0.0.1", "10.0.0.3"]]
+
+    async def rotating(host, port, *a, **kw):
+        addrs = order.pop(0) if order else ["10.0.0.1"]
+        return [(None, None, None, "", (a_, 0)) for a_ in addrs]
+
+    cfg = CrawlSettings(respect_robots=False)
+    async with httpx.AsyncClient() as client:
+        pol = Politeness(cfg, client)
+        monkeypatch.setattr(_asyncio.get_running_loop(), "getaddrinfo", rotating)
+        first = await pol.server_key("rr.test")
+        pol._server_keys.clear()
+        second = await pol.server_key("rr.test")
+        assert first == second == "10.0.0.1"
