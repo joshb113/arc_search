@@ -68,6 +68,29 @@ def register_cuda_runtime() -> list[str]:
     if sys.platform != "win32":
         return []
 
+    # 🔴 torch MUST load its CUDA DLLs before we touch PATH. Measured, not
+    # theorised:
+    #
+    #   insightface then torch  ->  OSError WinError 127, torch cannot load
+    #                               torch\lib\cudnn_cnn64_9.dll
+    #   torch then insightface  ->  both on CUDA, both keep working
+    #
+    # onnxruntime-gpu bundles the CUDA **13** runtime (nvidia/cu13/...) and
+    # torch bundles **12.8**. Prepending cu13 to PATH is what makes onnxruntime
+    # find cublasLt -- and it is also what makes torch's cu128 cuDNN resolve its
+    # dependencies against the wrong CUDA generation. Whichever library loads
+    # its DLLs first wins, because already-loaded modules ignore later PATH
+    # changes.
+    #
+    # Importing torch here rather than documenting the ordering: an import-order
+    # rule that is written down but not enforced is one refactor away from a
+    # WinError 127 that looks like a broken GPU. The import is cheap when torch
+    # is already loaded and skipped entirely when it is not installed.
+    import contextlib
+
+    with contextlib.suppress(ImportError):
+        import torch  # noqa: F401
+
     root = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
     if not root.is_dir():
         return []

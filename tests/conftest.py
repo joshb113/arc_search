@@ -8,10 +8,24 @@ See that module's docstring.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from imagefixtures import make_image
 from pgfixtures import DSN, require_test_database, wipe
+
+# HuggingFace caches models under ~/.cache/huggingface by default, which on this
+# machine is a C: drive sitting at ~97% full -- and DINOv2 + SigLIP2 are ~1.5 GB.
+# A gpu-marked test run without HF_HOME set silently re-downloaded them there and
+# took 700 MB off the system disk.
+#
+# Set here rather than documented, because "remember to export HF_HOME" is a rule
+# that gets forgotten exactly once and then costs a disk. Anything already in the
+# environment wins, so CI and other machines are unaffected.
+os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / "data" / "hf-cache"))
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
 @pytest.fixture

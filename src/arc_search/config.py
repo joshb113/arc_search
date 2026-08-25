@@ -185,6 +185,46 @@ class CollectionSpec:
     search_ef: int = 256
     point_id: str = "uuid"  # "uuid" | "image_id"
 
+    # Named vectors, as ((name, dim), ...). Empty means a single unnamed vector
+    # of size ``dim`` -- which is what the faces collection has and must keep.
+    #
+    # The images collection carries TWO vectors on ONE point: `scene` and `text`.
+    # They belong together because both are per-image, so they share an identity;
+    # keeping them on one point halves point overhead and makes it impossible for
+    # an image to have one vector and not the other.
+    named: tuple[tuple[str, int], ...] = ()
+
+
+class EmbedSettings(BaseSettings):
+    """Whole-image embedding: scene and text. ADR-005.
+
+    Both models are swappable by env var on purpose. ``facebook/dinov3-*`` is
+    gated=manual on HuggingFace and access has to be granted by a human, so the
+    ungated DINOv2 is the default -- it is the same 768 dimensions and was
+    measured here at 179 img/s. Swapping to DINOv3 must be a config change and a
+    re-embed, not a rewrite, and hardcoding either one would decide an open
+    question by accident (see research/image-model-bringup).
+    """
+
+    model_config = _cfg("ARC_EMBED_")
+
+    # Scene: image -> image, whole-scene similarity.
+    scene_model: str = "facebook/dinov2-base"
+    # Text: the joint text/image space. NOTE this is the model's IMAGE tower --
+    # what gets stored per image is a SigLIP *image* embedding, which a SigLIP
+    # *text* embedding can then be searched against. It is NOT an embedding of
+    # the alt text; that is a different (also useful) thing this does not do.
+    text_model: str = "google/siglip2-base-patch16-384"
+
+    device: str = "cuda"
+    batch_size: int = 16
+
+    # SigLIP is a sigmoid-loss model: raw cosine is not its scale. Scores must go
+    # through sigmoid(cosine * logit_scale + logit_bias), both read off the model.
+    # Read raw, a working model looks broken -- that cost a false alarm during
+    # bring-up. Kept here so nothing has to rediscover it.
+    text_uses_sigmoid_scale: bool = True
+
 
 class IndexSettings(BaseSettings):
     model_config = _cfg("ARC_INDEX_")
@@ -250,6 +290,7 @@ class IndexSettings(BaseSettings):
             hnsw_ef_construct=self.hnsw_ef_construct,
             search_ef=self.search_ef,
             point_id="image_id",
+            named=(("scene", self.scene_dim), ("text", self.text_dim)),
         )
 
 
@@ -275,6 +316,7 @@ class SearchSettings(BaseSettings):
 class Settings(BaseSettings):
     crawl: CrawlSettings = Field(default_factory=CrawlSettings)
     face: FaceSettings = Field(default_factory=FaceSettings)
+    embed: EmbedSettings = Field(default_factory=EmbedSettings)
     index: IndexSettings = Field(default_factory=IndexSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
 
@@ -282,6 +324,7 @@ class Settings(BaseSettings):
 _GROUPS: tuple[tuple[str, type[BaseSettings]], ...] = (
     ("ARC_CRAWL_", CrawlSettings),
     ("ARC_FACE_", FaceSettings),
+    ("ARC_EMBED_", EmbedSettings),
     ("ARC_INDEX_", IndexSettings),
     ("ARC_SEARCH_", SearchSettings),
 )

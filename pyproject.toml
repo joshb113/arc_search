@@ -93,7 +93,10 @@ testpaths = ["tests"]
 # latter silently prepends the CWD, which hid a broken import until CI (which
 # runs bare) caught it. Run bare pytest locally to match CI.
 pythonpath = ["src", "tests"]
-addopts = "-q --strict-markers"
+addopts = "-q --strict-markers -m 'not gpu'"
+# gpu tests load DINOv2 + SigLIP2 (~1.5 GB, ~30 s) and need a CUDA device, so
+# they are OUT of the default run -- the CI gpu job opts back in with its own
+# -m, which overrides this one. Run them locally with: pytest -m gpu
 asyncio_mode = "strict"                       # async tests must be marked, explicitly
 asyncio_default_fixture_loop_scope = "function"
 markers = [

@@ -130,17 +130,29 @@ class VectorStore:
         if self._client.collection_exists(self.name):
             return False
 
-        self._client.create_collection(
-            self.name,
-            vectors_config=models.VectorParams(
-                size=spec.dim,
+        def params(size: int) -> models.VectorParams:
+            return models.VectorParams(
+                size=size,
                 distance=models.Distance.COSINE,
                 # Originals stay on disk; the int8 copy in RAM is what gets
-                # searched. At 10M faces the originals are ~20 GB and the
-                # quantized copy ~5 GB -- see the disk-budget note in
-                # vault/plans/plan-002-index-and-query.md.
+                # searched. Keeping BOTH is ADR-005's storage decision and the
+                # reason the scale target is 280 GB rather than 96 GB -- it buys
+                # rescoring, and dropping it would trade recall for disk on an
+                # assumption nobody has measured.
                 on_disk=True,
-            ),
+            )
+
+        # One unnamed vector (faces) or several named ones (images: scene+text).
+        # Named vectors share a POINT, which is only correct when the things
+        # share an identity -- true for scene and text, both per-image; false
+        # for faces, which are per-face. See CollectionSpec.
+        vectors_config = (
+            {name: params(dim) for name, dim in spec.named} if spec.named else params(spec.dim)
+        )
+
+        self._client.create_collection(
+            self.name,
+            vectors_config=vectors_config,
             # int8 scalar, NOT binary. Face embeddings tolerate binarization far
             # worse than CLIP does, and the recall it costs lands precisely on
             # the hard, low-quality matches this engine exists to find.
@@ -184,6 +196,21 @@ class VectorStore:
         info = self._client.get_collection(self.name)
         params = info.config.params.vectors
         problems: list[str] = []
+
+        # A named-vector collection returns a DICT of name -> VectorParams, not
+        # a single VectorParams. Reading `.size` off the dict would raise, and
+        # `getattr(..., None)` would quietly report a mismatch against None --
+        # which is worse, because verify() exists precisely to be believed.
+        if self._spec.named:
+            expected = dict(self._spec.named)
+            live = params if isinstance(params, dict) else {}
+            for name, dim in expected.items():
+                got = getattr(live.get(name), "size", None)
+                if got != dim:
+                    problems.append(f"{name}: config={dim} live={got}")
+            for name in set(live) - set(expected):
+                problems.append(f"{name}: present live, absent from config")
+            return problems
         if getattr(params, "size", None) != self._spec.dim:
             problems.append(f"vector_dim: config={self._spec.dim} live={params.size}")
         if getattr(params, "distance", None) != models.Distance.COSINE:
@@ -294,6 +321,89 @@ class VectorStore:
                 )
             )
         return out
+
+    # -- named-vector collections (the images collection) --------------------
+
+    def upsert_image(self, image_id: int, vectors: dict[str, np.ndarray]) -> None:
+        """Write one image's named vectors, keyed by the Postgres ``image.id``.
+
+        The point id IS the row id, which is why this needs no mapping table and
+        why an orphaned vector is not representable here. It also makes the
+        write idempotent for free: a re-run overwrites rather than duplicating,
+        so a crash before ``mark_embedded`` converges on re-run.
+
+        All of the collection's named vectors must be supplied. Writing one and
+        not the other would leave an image findable by scene and invisible to
+        text, which is the sort of half-state that shows up as "search is
+        broken" months later.
+        """
+        expected = {name for name, _ in self._spec.named}
+        if not expected:
+            raise ValueError(f"{self.name} has no named vectors; use upsert()")
+        missing = expected - set(vectors)
+        if missing:
+            raise ValueError(f"missing named vectors for image {image_id}: {sorted(missing)}")
+
+        sized = dict(self._spec.named)
+        payload_vecs: dict[str, list[float]] = {}
+        for name, vec in vectors.items():
+            v = np.asarray(vec, dtype=np.float32).reshape(-1)
+            if v.shape != (sized[name],):
+                raise ValueError(
+                    f"vector {name!r} for image {image_id} has shape {v.shape}, "
+                    f"expected ({sized[name]},)"
+                )
+            payload_vecs[name] = v.tolist()
+
+        self._client.upsert(
+            self.name,
+            points=[
+                models.PointStruct(id=image_id, vector=payload_vecs, payload={"image_id": image_id})
+            ],
+        )
+
+    def search_named(
+        self,
+        vector_name: str,
+        embedding: np.ndarray,
+        limit: int = 50,
+        exclude: Iterable[int] = (),
+    ) -> list[tuple[int, float]]:
+        """Search one named vector. Returns (image_id, cosine) in rank order.
+
+        ``vector_name`` picks the mode: ``scene`` for image->image, ``text`` for
+        text->image. They are separate spaces and mixing them returns nonsense,
+        so the caller names which one it means rather than a default deciding.
+
+        Scores are RAW COSINE. For the text vector that is *not* the model's
+        scale -- SigLIP is sigmoid-loss and needs
+        ``ImageEmbedder.text_logit_params()``. Non-negotiable #5 applies here as
+        much as it does to faces.
+        """
+        sized = dict(self._spec.named)
+        if vector_name not in sized:
+            raise ValueError(f"{self.name} has no vector {vector_name!r}; have {sorted(sized)}")
+        emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if emb.shape != (sized[vector_name],):
+            raise ValueError(
+                f"query for {vector_name!r} has shape {emb.shape}, expected ({sized[vector_name]},)"
+            )
+
+        excluded = [int(i) for i in exclude]
+        flt = models.Filter(must_not=[models.HasIdCondition(has_id=excluded)]) if excluded else None
+        resp = self._client.query_points(
+            self.name,
+            query=emb.tolist(),
+            using=vector_name,
+            limit=limit,
+            query_filter=flt,
+            search_params=models.SearchParams(
+                hnsw_ef=self._spec.search_ef,
+                quantization=models.QuantizationSearchParams(rescore=True),
+            ),
+            with_payload=False,
+        )
+        return [(int(p.id), float(p.score)) for p in resp.points]
 
     def count(self) -> int:
         if not self._client.collection_exists(self.name):

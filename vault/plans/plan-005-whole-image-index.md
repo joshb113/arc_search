@@ -83,8 +83,18 @@ verified to 2**63-1 against the live server. So the whole-image collection needs
 payload filter, and an orphaned vector is *structurally impossible* — the point
 id and the row id are the same thing.
 
-## Phase 2 – Embedding in the crawl loop ⬜
+## Phase 2 – Embedding in the crawl loop 🟡
 
+**Embedder + write path done 2026-08-25.** 359 tests (+4 gpu-marked, excluded by
+default). Proven end to end on real corpus images: *"a photo of a fish"* returns
+the fish at p=0.335 with every person at 0.000; *"a bearded man"* returns the
+bearded man; scene more-like-this from the fish scores 1.000 against ~0.01.
+
+- [x] `index/embed.py` — `ImageEmbedder`, models swappable by `ARC_EMBED_*`.
+      Reports its **effective** device, never the requested one.
+- [x] Named-vector collection support in `VectorStore` — `upsert_image()` /
+      `search_named()`. Refuses a half-written pair, refuses a wrong dim,
+      refuses an unknown vector name.
 - [ ] Scene + text embedding at the existing sink call site, from bytes already
       in hand
 - [ ] 🔴 **A model failure must not kill the crawl.** The frontier is durable and
