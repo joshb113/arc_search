@@ -248,8 +248,10 @@ def create_app(deps: Deps) -> FastAPI:
             return HTMLResponse(_page(_home(deps)))
 
         vec = deps.embedder.embed_text([q])[0]
-        hits = deps.image_vectors.search_named("text", vec, limit=limit)
-        results = deps.repo.hydrate_images(hits)
+        # Over-fetch, then collapse: a near-dup must not consume one of the
+        # k slots it is about to be folded into.
+        hits = deps.image_vectors.search_named("text", vec, limit=limit * 3)
+        results = deps.repo.collapse_near_duplicates(deps.repo.hydrate_images(hits))[:limit]
 
         if format == "json":
             return JSONResponse(
@@ -282,8 +284,8 @@ def create_app(deps: Deps) -> FastAPI:
 
         pil = Image.fromarray(img[:, :, ::-1])  # cv2 gives BGR; PIL wants RGB
         (vec,) = deps.embedder.embed_images([pil])
-        hits = deps.image_vectors.search_named("scene", vec.scene, limit=limit)
-        results = deps.repo.hydrate_images(hits)
+        hits = deps.image_vectors.search_named("scene", vec.scene, limit=limit * 3)
+        results = deps.repo.collapse_near_duplicates(deps.repo.hydrate_images(hits))[:limit]
 
         if format == "json":
             return JSONResponse(
@@ -313,11 +315,11 @@ def create_app(deps: Deps) -> FastAPI:
             raise HTTPException(404, "that image has no scene vector")
         vec = points[0].vector["scene"]
         hits = deps.image_vectors.search_named(
-            "scene", np.asarray(vec, dtype=np.float32), limit=limit + 1
+            "scene", np.asarray(vec, dtype=np.float32), limit=limit * 3 + 1
         )
         # Drop the query image itself; it is trivially its own nearest neighbour.
-        hits = [h for h in hits if h[0] != image_id][:limit]
-        results = deps.repo.hydrate_images(hits)
+        hits = [h for h in hits if h[0] != image_id]
+        results = deps.repo.collapse_near_duplicates(deps.repo.hydrate_images(hits))[:limit]
         return HTMLResponse(_page(_image_results(deps, "scene", f"image #{image_id}", results)))
 
     @app.post("/search")
@@ -530,7 +532,13 @@ def _image_results(deps, mode: str, query: str, results) -> str:
             f"<a href='/similar/{r.image_id}' title='more like this'>"
             f"<img src='/thumb/{r.image_id}' loading=lazy alt=''></a>"
             "<div class=body>"
-            f"<div class=s>{r.score:.4f}</div>{alt}"
+            f"<div class=s>{r.score:.4f}"
+            + (
+                f" <span class=n style='font-weight:400'>+{r.duplicates} dup</span>"
+                if r.duplicates
+                else ""
+            )
+            + f"</div>{alt}"
             f"<div class=n>{r.width}&times;{r.height}"
             + (f" &middot; {r.face_count} face(s)" if r.face_count > 0 else "")
             + "</div>"
@@ -543,8 +551,9 @@ def _image_results(deps, mode: str, query: str, results) -> str:
         "<div class=note>Thumbnails are re-fetched by <b>this machine</b>, not by "
         "your browser, so the source host never learns which results you looked "
         "at. First view of each is rate-limited; afterwards it is cached.<br>"
-        "⚠️ Near-duplicate collapse is not active — PDQ is not computed yet, "
-        "so the same image republished across years appears more than once.</div>"
+        "Near-duplicate copies are folded together by PDQ perceptual hash and "
+        "marked <b>+n dup</b>; the threshold is PDQ's conventional 31 and is not "
+        "yet calibrated against this corpus.</div>"
     )
     out.append("<p><a href=/>&larr; search again</a></p>")
     return "".join(out)

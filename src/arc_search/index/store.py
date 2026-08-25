@@ -142,6 +142,7 @@ class PendingImage(UnexaminedImage):
 
     needs_faces: bool = True
     needs_embed: bool = True
+    needs_pdq: bool = True
 
 
 def path_of(url: str) -> str:
@@ -345,14 +346,15 @@ class PostgresWriter:
         img_host = (urlsplit(fetched.final_url).hostname or "").lower()
         row = self._exec(
             """
-            INSERT INTO image (sha1, width, height, byte_size, face_count,
+            INSERT INTO image (sha1, pdq, width, height, byte_size, face_count,
                                domain_id, url_path)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s::bit(256), %s, %s, %s, %s, %s, %s)
             ON CONFLICT (sha1) DO NOTHING
             RETURNING id
             """,
             (
                 digest,
+                self._pdq_of(fetched.body),
                 fetched.width,
                 fetched.height,
                 len(fetched.body),
@@ -374,6 +376,46 @@ class PostgresWriter:
         self.dedup.register(digest, None, image_id, face_count=UNEXAMINED)
         self._link(image_id, context)
         return verdict
+
+    def _pdq_of(self, raw: bytes) -> str | None:
+        """Perceptual hash for near-duplicate detection. None if undecodable.
+
+        Computed here rather than in a later tier because this is the only place
+        that sees the bytes on the crawl path, and because non-negotiable #2 puts
+        PDQ in the dedup order: SHA1 exact-match first, **then** PDQ, then the
+        GPU. It costs a decode of a small image, which is sub-millisecond
+        against a fetch budget measured in whole seconds.
+
+        ⚠️ Computed and STORED, but it does not yet change any dedup verdict.
+        Turning on near-duplicate *skipping* changes what the corpus contains,
+        which is a decision with corpus-wide consequences and belongs in its own
+        change. What this unblocks now is calibration (near-dups inflate every
+        recall number) and near-duplicate collapse in the result grid.
+
+        Returns None rather than raising: a decode failure must cost the hash,
+        not the row. An image with no PDQ is simply invisible to near-dup
+        matching, which is where it already was.
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            from arc_search.index.dedup import pdq_to_sql, perceptual_hash
+
+            img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                return None
+            bits, quality = perceptual_hash(img)
+            # PDQ reports its own confidence. A flat or noisy image produces a
+            # hash whose neighbours are meaningless; storing it would create
+            # false near-dup links rather than leave a gap.
+            if quality < 50:
+                log.debug("store.pdq_low_quality", quality=quality)
+                return None
+            return pdq_to_sql(bits)
+        except Exception as exc:
+            log.warning("store.pdq_failed", error=f"{type(exc).__name__}: {exc}")
+            return None
 
     def _link(self, image_id: int, context: ImageContext) -> None:
         """Record that this image appeared on this page, with its alt text."""
@@ -503,7 +545,13 @@ class PostgresWriter:
         ]
 
     def pending_images(
-        self, limit: int = 1000, after_id: int = 0, *, faces: bool = True, embed: bool = True
+        self,
+        limit: int = 1000,
+        after_id: int = 0,
+        *,
+        faces: bool = True,
+        embed: bool = True,
+        pdq: bool = True,
     ) -> list[PendingImage]:
         """Images needing face examination, whole-image embedding, or both.
 
@@ -518,17 +566,19 @@ class PostgresWriter:
         cannot perform means fetching it, doing nothing, and fetching it again
         next run -- forever.
         """
-        if not faces and not embed:
+        if not (faces or embed or pdq):
             return []
         clauses = []
         if faces:
             clauses.append("i.face_count = -1")
         if embed:
             clauses.append("i.embed_state = -1")
+        if pdq:
+            clauses.append("i.pdq IS NULL")
         rows = self._exec(
             f"""
             SELECT i.id, d.host, i.url_path, i.width, i.height,
-                   i.face_count, i.embed_state
+                   i.face_count, i.embed_state, i.pdq
             FROM image i
             JOIN domain d ON d.id = i.domain_id
             WHERE ({" OR ".join(clauses)}) AND i.id > %s
@@ -545,20 +595,40 @@ class PostgresWriter:
                 height=r[4],
                 needs_faces=r[5] == UNEXAMINED,
                 needs_embed=r[6] == UNEMBEDDED,
+                needs_pdq=r[7] is None,
             )
             for r in rows
         ]
 
-    def pending_count(self, *, faces: bool = True, embed: bool = True) -> int:
-        if not faces and not embed:
+    def pending_count(self, *, faces: bool = True, embed: bool = True, pdq: bool = True) -> int:
+        if not (faces or embed or pdq):
             return 0
         clauses = []
         if faces:
             clauses.append("face_count = -1")
         if embed:
             clauses.append("embed_state = -1")
+        if pdq:
+            clauses.append("pdq IS NULL")
         row = self._exec(f"SELECT count(*) FROM image WHERE {' OR '.join(clauses)}").fetchone()
         return row[0] if row else 0
+
+    def set_pdq(self, image_id: int, raw: bytes) -> bool:
+        """Compute and store the perceptual hash for an already-recorded image.
+
+        For the backfill: PDQ needs pixels, and the crawl tier only started
+        writing it after ADR-005's grid made near-duplicates visible. Everything
+        crawled before that has ``pdq IS NULL`` and needs one re-fetch.
+
+        Returns False when no usable hash could be produced -- undecodable, or
+        PDQ's own quality score below 50. The column stays NULL, which is the
+        honest state: absent, not zero.
+        """
+        value = self._pdq_of(raw)
+        if value is None:
+            return False
+        self._exec("UPDATE image SET pdq = %s::bit(256) WHERE id = %s", (value, image_id))
+        return True
 
     def image_id_for_sha1(self, digest: bytes) -> int | None:
         """Look up an image by its content hash.

@@ -488,9 +488,14 @@ class ImageRepo(FakeRepo):
         super().__init__(**kw)
         self._image_hits = image_hits if image_hits is not None else [_ihit()]
         self.urls = {1: "https://conf.test/i/x.png"}
+        self.collapsed = False
 
     def hydrate_images(self, hits):
         return self._image_hits
+
+    def collapse_near_duplicates(self, hits, threshold=31):
+        self.collapsed = True
+        return hits
 
     def image_url(self, image_id):
         return self.urls.get(image_id)
@@ -665,3 +670,120 @@ def test_an_oversized_image_does_not_evict_the_whole_cache():
 
     assert c.get(1) is not None, "a single huge image must not flush everything"
     assert c.get(2) is None
+
+
+# --- near-duplicate collapse (PDQ) -----------------------------------------
+
+
+def test_every_whole_image_mode_collapses_duplicates():
+    """Measured need: 66% of labelled genuine pairs in this corpus are the same
+    photo republished, and 223 of 225 have a different sha1. Without collapse the
+    first page fills with the same sponsor logo."""
+    client, deps = _iclient()
+    client.get("/text", params={"q": "x"})
+    assert deps.repo.collapsed, "text mode did not collapse"
+
+    deps.repo.collapsed = False
+    client.post(
+        "/similar",
+        files={"photo": ("q.png", make_image(3, "PNG"), "image/png")},
+    )
+    assert deps.repo.collapsed, "scene mode did not collapse"
+
+
+def test_the_fold_count_is_shown_not_hidden():
+    """'8 results' that were really 40 is the kind of quiet lie that makes an
+    index untrustworthy."""
+    from arc_search.serve.repo import ImageHit
+
+    hit = ImageHit(
+        image_id=1,
+        score=0.4,
+        url="https://c.test/x.png",
+        width=10,
+        height=10,
+        face_count=0,
+        alt=None,
+        pages=[],
+        duplicates=3,
+    )
+    client, _ = _iclient(image_hits=[hit])
+    assert "+3 dup" in client.get("/text", params={"q": "x"}).text
+
+
+@pytest.mark.integration
+@needs_pg
+def test_collapse_keeps_the_best_scoring_copy(writer, png):
+    """Rank-preserving and greedy: the survivor is always the highest-scoring
+    member of its group, and the rest are counted onto it."""
+    from arc_search.serve.repo import ImageHit, SearchRepo
+    from imagefixtures import make_image as mk
+    from pgfixtures import DSN, ctx, img
+
+    # Two images with IDENTICAL pixels re-encoded, plus one genuinely different.
+    same = mk(11, "PNG")
+    ids = []
+    for i, body in enumerate([same, same, mk(12, "PNG")]):
+        writer.handle(img(body, url=f"https://conf.test/d/{i}.png"), ctx())
+        ids.append(writer._exec("SELECT id FROM image ORDER BY id DESC LIMIT 1").fetchone()[0])
+    # The first two are byte-identical, so sha1 dedup collapses them to one row.
+    # Force the interesting case: a distinct row whose PDQ matches an existing one.
+    pdq = writer._exec("SELECT pdq FROM image WHERE id = %s", (ids[0],)).fetchone()[0]
+    assert pdq is not None, "PDQ was not computed on insert"
+    writer._exec(
+        "INSERT INTO image (sha1, pdq, width, height, byte_size, domain_id, url_path) "
+        "VALUES (%s, %s::bit(256), 10, 10, 99, %s, %s)",
+        (b"\x11" * 20, pdq, writer.domain_id("conf.test"), "/d/clone.png"),
+    )
+    clone = writer._exec("SELECT id FROM image ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+    def h(image_id, score):
+        return ImageHit(
+            image_id=image_id,
+            score=score,
+            url="u",
+            width=10,
+            height=10,
+            face_count=0,
+            alt=None,
+            pages=[],
+        )
+
+    repo = SearchRepo(DSN)
+    try:
+        out = repo.collapse_near_duplicates([h(ids[0], 0.9), h(clone, 0.8), h(ids[-1], 0.7)])
+        assert [r.image_id for r in out] == [ids[0], ids[-1]], "clone was not folded"
+        assert out[0].duplicates == 1
+        assert out[1].duplicates == 0
+    finally:
+        repo.close()
+
+
+@pytest.mark.integration
+@needs_pg
+def test_an_image_without_a_hash_is_kept_not_guessed(writer, png):
+    """A missing PDQ is not evidence of duplication. Undecodable or low-quality
+    images must still appear rather than being folded into something arbitrary."""
+    from arc_search.serve.repo import ImageHit, SearchRepo
+    from pgfixtures import DSN, ctx, img
+
+    writer.handle(img(png), ctx())
+    real = writer._exec("SELECT id FROM image ORDER BY id DESC LIMIT 1").fetchone()[0]
+    writer._exec(
+        "INSERT INTO image (sha1, width, height, byte_size, domain_id, url_path) "
+        "VALUES (%s, 10, 10, 99, %s, %s)",
+        (b"\x22" * 20, writer.domain_id("conf.test"), "/nohash.png"),
+    )
+    nohash = writer._exec("SELECT id FROM image ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+    def h(i, s):
+        return ImageHit(
+            image_id=i, score=s, url="u", width=10, height=10, face_count=0, alt=None, pages=[]
+        )
+
+    repo = SearchRepo(DSN)
+    try:
+        out = repo.collapse_near_duplicates([h(real, 0.9), h(nohash, 0.8)])
+        assert [r.image_id for r in out] == [real, nohash]
+    finally:
+        repo.close()

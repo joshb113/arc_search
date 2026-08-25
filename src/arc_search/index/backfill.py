@@ -74,6 +74,7 @@ class BackfillStats:
     faces_indexed: int = 0
     embedded: int = 0
     embed_failed: int = 0
+    hashed: int = 0
     rejects: dict[str, int] = field(default_factory=dict)
 
     def add_rejects(self, r) -> None:
@@ -103,6 +104,7 @@ class BackfillStats:
             f"    faces indexed                   {self.faces_indexed:>8}",
             f"    images embedded (scene+text)    {self.embedded:>8}",
             f"      embed failed                  {self.embed_failed:>8}",
+            f"    PDQ hashes computed             {self.hashed:>8}",
         ]
         if self.rejects:
             out.append("")
@@ -150,7 +152,8 @@ class Backfill:
         # This matters for the queue: including an image whose sole outstanding
         # job is one we cannot perform means fetching it, doing nothing, and
         # fetching it again next run, forever.
-        self._q = {"faces": True, "embed": self._do_embed}
+        # PDQ needs only the bytes, so it is always a job this runner can do.
+        self._q = {"faces": True, "embed": self._do_embed, "pdq": True}
 
     def stop(self) -> None:
         """Ctrl-C. Finishes the image in flight, then exits cleanly."""
@@ -197,6 +200,20 @@ class Backfill:
         # Whole-image embedding first, from the same bytes. Isolated exactly as
         # the crawl-loop sink is: an embedding failure must not cost the face
         # work that this fetch also paid for.
+        # Perceptual hash first: it is the cheapest thing this fetch can pay
+        # for, needs nothing but the bytes, and near-duplicate collapse in the
+        # result grid depends on it.
+        if getattr(item, "needs_pdq", False):
+            try:
+                if self._w.set_pdq(item.image_id, fetched.body):
+                    self.stats.hashed += 1
+            except Exception as exc:
+                log.warning(
+                    "backfill.pdq_failed",
+                    image_id=item.image_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
         if self._do_embed and getattr(item, "needs_embed", False):
             self._embed_one(item, fetched.body)
 

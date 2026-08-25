@@ -88,6 +88,36 @@ def hamming(a: np.ndarray, b: np.ndarray) -> int:
     return int(np.unpackbits(np.bitwise_xor(a, b)).sum())
 
 
+# ---- the one place that owns the on-disk PDQ representation ----------------
+#
+# ⚠️ `pdqhash.compute()` returns **256 separate 0/1 bytes**, not 32 packed ones.
+# Measured, because it is not what the name suggests and everything downstream
+# depends on it:
+#
+#     np.asarray(pdqhash.compute(rgb)[0], dtype=np.uint8).shape  ->  (256,)
+#
+# `hamming()` above happens to be correct on that representation -- XOR gives 0
+# or 1 per position and unpackbits(1) sums to 1 -- so distances are right, just
+# stored 8x wider than they need to be.
+#
+# Postgres holds it as BIT(256) and **psycopg returns a `str`**, not bytes. That
+# is the trap: `Deduper.load()` used to call `np.frombuffer(pdq, ...)`, which
+# raises TypeError on a str. It never fired because `pdq` was always NULL, so
+# the first crawl after PDQ started being written would have died at startup.
+
+
+def pdq_to_bits(value) -> np.ndarray:
+    """Postgres BIT(256) (or raw bytes) -> the 0/1 array the BK-tree uses."""
+    if isinstance(value, str):
+        return np.frombuffer(value.encode("ascii"), dtype=np.uint8) - ord("0")
+    return np.frombuffer(value, dtype=np.uint8)
+
+
+def pdq_to_sql(bits: np.ndarray) -> str:
+    """The 0/1 array -> a string Postgres will cast to BIT(256)."""
+    return "".join("1" if b else "0" for b in bits)
+
+
 class BKTree:
     """BK-tree over Hamming distance for near-duplicate probes.
 
@@ -156,7 +186,7 @@ class Deduper:
             if face_count == 0:
                 self._barren.add(sha1)
             if pdq is not None:
-                self._tree.add(np.frombuffer(pdq, dtype=np.uint8), image_id)
+                self._tree.add(pdq_to_bits(pdq), image_id)
         log.info("dedup.loaded", images=len(self._sha1), pdq=len(self._tree))
 
     def check_bytes(self, raw: bytes) -> DedupResult | None:

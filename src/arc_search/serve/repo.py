@@ -15,7 +15,7 @@ most.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import psycopg
 import structlog
@@ -57,6 +57,10 @@ class ImageHit:
     face_count: int
     alt: str | None
     pages: list[str] = field(default_factory=list)
+    # How many near-identical copies were folded into this result. Surfaced in
+    # the UI rather than silently dropped -- "8 results" that were really 40 is
+    # the kind of quiet lie that makes an index untrustworthy.
+    duplicates: int = 0
 
 
 class SearchRepo:
@@ -226,6 +230,57 @@ class SearchRepo:
             )
         out.sort(key=lambda h: order[h.image_id])
         return out
+
+    def collapse_near_duplicates(self, hits: list[ImageHit], threshold: int = 31) -> list[ImageHit]:
+        """Fold republished copies of the same image into one result.
+
+        Measured need: of 225 labelled genuine pairs in this corpus, **149 (66%)
+        are the same photograph re-published in a later year**, and 223 of 225
+        have a DIFFERENT sha1 because they were re-encoded. Exact-hash dedup
+        cannot see them at all, which is what PDQ is for.
+
+        Without this, the first page of a grid fills with the same sponsor logo.
+
+        Greedy and rank-preserving: walk in score order, keep a hit unless it is
+        within ``threshold`` of one already kept. The kept copy is therefore
+        always the highest-scoring one, and ``duplicates`` records how many were
+        folded in so the UI can say so rather than silently dropping results.
+
+        ``threshold`` 31 is PDQ's conventional "same image" boundary for 256
+        bits. ⚠️ It is NOT calibrated against this corpus -- measured here, a
+        JPEG re-encode of the same image scores 10, so 31 has real headroom, but
+        that is one data point and not a derivation.
+        """
+        if not hits:
+            return []
+
+        from arc_search.index.dedup import hamming, pdq_to_bits
+
+        rows = self._exec(
+            "SELECT id, pdq FROM image WHERE id = ANY(%s) AND pdq IS NOT NULL",
+            ([h.image_id for h in hits],),
+        ).fetchall()
+        bits = {r[0]: pdq_to_bits(r[1]) for r in rows}
+
+        kept: list[ImageHit] = []
+        kept_bits: list = []
+        for h in hits:
+            mine = bits.get(h.image_id)
+            if mine is None:
+                # No hash -- undecodable, or too low-quality for PDQ to be
+                # meaningful. Show it rather than guess; a missing hash is not
+                # evidence of duplication.
+                kept.append(h)
+                continue
+            dup_of = next(
+                (i for i, k in enumerate(kept_bits) if hamming(mine, k) <= threshold), None
+            )
+            if dup_of is None:
+                kept.append(h)
+                kept_bits.append(mine)
+            else:
+                kept[dup_of] = replace(kept[dup_of], duplicates=kept[dup_of].duplicates + 1)
+        return kept
 
     def image_url(self, image_id: int) -> str | None:
         row = self._exec(
