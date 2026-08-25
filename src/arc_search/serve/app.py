@@ -248,25 +248,38 @@ def create_app(deps: Deps) -> FastAPI:
             return HTMLResponse(_page(_home(deps)))
 
         vec = deps.embedder.embed_text([q])[0]
+        # SigLIP is a sigmoid-loss model and ships its OWN calibration. Using
+        # logit_scale/logit_bias is not inventing a threshold (non-negotiable
+        # #5) -- it is reporting what the model already says, instead of the raw
+        # cosine it never meant as an answer.
+        scale, bias = deps.embedder.text_logit_params()
         # Over-fetch, then collapse: a near-dup must not consume one of the
         # k slots it is about to be folded into.
         hits = deps.image_vectors.search_named("text", vec, limit=limit * 3)
         results = deps.repo.collapse_near_duplicates(deps.repo.hydrate_images(hits))[:limit]
+        probs = [_sigmoid(r.score * scale + bias) for r in results]
+        best = max(probs, default=0.0)
 
         if format == "json":
             return JSONResponse(
                 {
                     "query": q,
                     "mode": "text",
+                    # The model's own answer to "is this a match at all".
+                    "best_match_probability": round(best, 5),
+                    "matched": best >= 0.5,
                     "calibrated": deps.search_cfg.calibrated,
                     # SigLIP is sigmoid-loss: raw cosine is not even the model's
                     # own scale, let alone a probability. Named so no client can
                     # mistake it.
                     "score_type": "raw_cosine",
-                    "results": [_image_json(r) for r in results],
+                    "results": [
+                        {**_image_json(r), "probability": round(pr, 5)}
+                        for r, pr in zip(results, probs, strict=True)
+                    ],
                 }
             )
-        return HTMLResponse(_page(_image_results(deps, "text", q, results)))
+        return HTMLResponse(_page(_image_results(deps, "text", q, results, probs)))
 
     @app.post("/similar")
     async def similar(
@@ -500,6 +513,12 @@ def _home(deps) -> str:
     return "".join(out)
 
 
+def _sigmoid(x: float) -> float:
+    import math
+
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 def _image_json(r) -> dict:
     return {
         "image_id": r.image_id,
@@ -512,19 +531,40 @@ def _image_json(r) -> dict:
     }
 
 
-def _image_results(deps, mode: str, query: str, results) -> str:
+def _image_results(deps, mode: str, query: str, results, probs=None) -> str:
     enabled = deps.image_vectors is not None and deps.embedder is not None
     out = [_header(), _banner(deps.search_cfg), _tabs(mode, enabled)]
     out.append(
         f"<div class=sub>{html.escape(mode)} search for "
-        f"<b>{html.escape(query)}</b> — {len(results)} result(s)</div>"
+        f"<b>{html.escape(query)}</b> — {len(results)} nearest</div>"
     )
     if not results:
-        out.append("<div class=empty>Nothing matched.</div>")
+        out.append("<div class=empty>Nothing in the index.</div>")
         return "".join(out) + "<p><a href=/>&larr; search again</a></p>"
 
+    # 🔴 Vector search ALWAYS returns k results. It has no concept of "no
+    # match" -- it returns the nearest neighbours however far away they are. So
+    # an empty result set and a corpus that simply does not contain the thing
+    # look identical unless we say otherwise, and raw cosine cannot say it:
+    # measured, "xyzzy plugh nonsense" scores a HIGHER cosine (0.110) than
+    # "ballerina" (0.087). Cosine is not comparable across queries.
+    #
+    # The model is: SigLIP ships a trained logit_scale/logit_bias, and its
+    # sigmoid is the boundary it was optimised against. Reporting that is not
+    # inventing a threshold, it is stopping throwing one away.
+    best = max(probs) if probs else None
+    if best is not None and best < 0.5:
+        out.append(
+            "<div class=banner><b>No match found.</b> "
+            f"The best result scores <b>p&nbsp;=&nbsp;{best:.3f}</b> on the "
+            "model&rsquo;s own scale, so it does not consider any of these a match "
+            "for that query. They are simply the closest images in the index — "
+            "shown because nearest-neighbour search always returns something.</div>"
+        )
+
     cards = []
-    for r in results:
+    for idx, r in enumerate(results):
+        pr = probs[idx] if probs else None
         alt = f"<div class=n>{html.escape(r.alt)}</div>" if r.alt else "<div class=n>&nbsp;</div>"
         page = r.pages[0] if r.pages else r.url
         cards.append(
@@ -532,7 +572,12 @@ def _image_results(deps, mode: str, query: str, results) -> str:
             f"<a href='/similar/{r.image_id}' title='more like this'>"
             f"<img src='/thumb/{r.image_id}' loading=lazy alt=''></a>"
             "<div class=body>"
-            f"<div class=s>{r.score:.4f}"
+            + (
+                f"<div class=s>p {pr:.3f}"
+                f" <span class=n style='font-weight:400'>cos {r.score:.3f}</span>"
+                if pr is not None
+                else f"<div class=s>{r.score:.4f}"
+            )
             + (
                 f" <span class=n style='font-weight:400'>+{r.duplicates} dup</span>"
                 if r.duplicates

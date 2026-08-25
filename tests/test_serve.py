@@ -453,8 +453,13 @@ class FakeImageVectors:
 
 
 class FakeImageEmbedder:
-    def __init__(self):
+    def __init__(self, logit_scale=112.85, logit_bias=-16.77):
         self.texts = []
+        self._scale = logit_scale
+        self._bias = logit_bias
+
+    def text_logit_params(self):
+        return (self._scale, self._bias)
 
     def embed_text(self, texts):
         self.texts.extend(texts)
@@ -787,3 +792,66 @@ def test_an_image_without_a_hash_is_kept_not_guessed(writer, png):
         assert [r.image_id for r in out] == [real, nohash]
     finally:
         repo.close()
+
+
+# --- "no match" must not look like "here are your results" -----------------
+#
+# 🔴 Nearest-neighbour search ALWAYS returns k results. It has no concept of a
+# non-match -- it returns the closest vectors however far away they are. So a
+# corpus that simply does not contain the thing renders identically to a corpus
+# that does, unless the UI says otherwise.
+#
+# Raw cosine cannot say it. Measured on the live index: "xyzzy plugh nonsense"
+# scores a HIGHER cosine (0.110) than "ballerina" (0.087). Cosine is not
+# comparable across queries. SigLIP's own sigmoid is.
+
+
+def test_a_no_match_query_says_so():
+    """The bug this fixes: searching 'ballerina' against a conference archive
+    returned 24 confident-looking rows of speaker headshots."""
+    client, _ = _iclient(image_hits=[_ihit(score=0.0865)])
+    body = client.get("/text", params={"q": "ballerina"}).text
+    assert "No match found" in body
+    assert "does not consider any of these a match" in body
+
+
+def test_a_real_match_does_not_get_the_warning():
+    """A cosine of 0.153 is p=0.62 on SigLIP's scale -- a genuine match, and it
+    must not be labelled a non-match."""
+    client, _ = _iclient(image_hits=[_ihit(score=0.1530)])
+    assert "No match found" not in client.get("/text", params={"q": "a beard"}).text
+
+
+def test_the_model_probability_is_shown_not_just_cosine():
+    """Cosine is what the model computes; p is what it means. Showing only the
+    former hands the reader a number that is not comparable across queries."""
+    client, _ = _iclient(image_hits=[_ihit(score=0.1530)])
+    body = client.get("/text", params={"q": "a beard"}).text
+    assert "p 0.6" in body
+    assert "cos 0.153" in body, "raw cosine should stay visible, just secondary"
+
+
+def test_json_reports_whether_anything_matched():
+    """A client must be able to tell 'no results' from 'k nearest, none of them
+    it' without re-deriving the model's calibration itself."""
+    client, _ = _iclient(image_hits=[_ihit(score=0.0865)])
+    data = client.get("/text", params={"q": "ballerina", "format": "json"}).json()
+    assert data["matched"] is False
+    assert data["best_match_probability"] < 0.01
+    assert data["results"][0]["probability"] < 0.01
+
+    client, _ = _iclient(image_hits=[_ihit(score=0.1530)])
+    data = client.get("/text", params={"q": "a beard", "format": "json"}).json()
+    assert data["matched"] is True
+
+
+def test_scene_mode_shows_no_probability():
+    """DINOv2 has no sigmoid calibration -- its cosine is a plain similarity.
+    Inventing a probability for it would be exactly the assertion-over-
+    measurement that non-negotiable #5 forbids."""
+    client, _ = _iclient(image_hits=[_ihit(score=0.9)])
+    body = client.post(
+        "/similar", files={"photo": ("q.png", make_image(3, "PNG"), "image/png")}
+    ).text
+    assert "0.9000" in body
+    assert "No match found" not in body
