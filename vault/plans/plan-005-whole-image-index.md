@@ -144,21 +144,37 @@ bearded man; scene more-like-this from the fish scores 1.000 against ~0.01.
       ⚠️ But 86 identical ccc logos are still junk. The criterion should become
       **repetition, not facelessness**, with PDQ doing the work.
 
-## Phase 4 – Query ⬜
+## Phase 4 – Query ✅
 
-- [ ] Text → image search
-- [ ] Image → image search (upload, or "more like this" from a result)
-- [ ] Face mode stays, unchanged, as one tab of the same UI
-- [ ] 🔴 **PDQ near-duplicate collapse before display.** Already a prerequisite
+**Done 2026-08-25.** 392 tests. Verified against the live 4,753-image index.
+
+- [x] **Text → image.** `"a conference logo"` returns the actual FOSDEM 2016
+      flyer — a face-less image the old engine discarded entirely. That single
+      result is ADR-005's whole argument working.
+- [x] **Image → image**, by upload (`POST /similar`) and as *more like this*
+      from any result (`GET /similar/{id}`). The latter reuses the **stored**
+      vector rather than re-fetching and re-embedding — the point id is the
+      image id, so it is a retrieve, not a round trip to the source host.
+- [x] Face mode kept, unchanged, as one tab of three.
+- [ ] 🔴 **PDQ near-duplicate collapse before display — STILL OPEN.** The grid
+      currently shows the same image republished across years more than once,
+      and the UI says so rather than pretending otherwise. Already a prerequisite
       for calibration ([[research/first-index-and-calibration-preview]]: 223 of
       225 duplicate pairs have *different* sha1). For an image grid it is more
       visible — without it the first page fills with the same sponsor logo.
-- [ ] ⚠️ **Result display is re-fetch, and this is the weakest point in the
-      design.** A face result shows a crop we own; an image result is remote
-      pixels, and per the brain stem re-fetch must pass politeness and robots.
-      A 20-result grid concentrated on a few hosts renders over ~20 s at 1 rps.
-      ADR-005 notes a size-capped evictable LRU thumbnail cache as the middle
-      path — bounded, so non-negotiable #1's intent survives. **Undecided.**
+- [x] ⚠️ ~~**Result display is re-fetch**~~ — **decided: the SERVER fetches, and
+      caches.** The obvious alternative is `<img src="https://theirsite/…">`,
+      letting the browser do it: free, instant, no politeness budget. It is the
+      one thing this project cannot do — the source host would then get a
+      request per result *from the user's own address*, revealing exactly which
+      images they looked at. For a face search engine that inverts the premise.
+      "The corpus and the query stay on your hardware" has to include **which
+      results you looked at**.
+      So: `/thumb/{id}` proxies through the same politeness layer, behind a
+      **bounded, memory-only LRU** (64 MB default). Bounded because ADR-001
+      forbids persisting scene images — an unbounded or on-disk cache becomes
+      exactly the store non-negotiable #1 exists to prevent. Worst case is a
+      slow page, never a full disk.
 
 ---
 

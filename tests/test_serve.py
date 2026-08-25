@@ -437,3 +437,231 @@ def test_hydrate_preserves_rank_order_and_drops_orphans(writer, png):
         assert out[0].image_url == "https://conf.test/i/ada.png"
     finally:
         repo.close()
+
+
+# --- whole-image search (ADR-005) ------------------------------------------
+
+
+class FakeImageVectors:
+    def __init__(self, hits=None):
+        self.hits = hits if hits is not None else [(1, 0.42), (2, 0.31)]
+        self.last_mode = None
+
+    def search_named(self, vector_name, embedding, limit=50, exclude=()):
+        self.last_mode = vector_name
+        return self.hits[:limit]
+
+
+class FakeImageEmbedder:
+    def __init__(self):
+        self.texts = []
+
+    def embed_text(self, texts):
+        self.texts.extend(texts)
+        return np.zeros((len(texts), 768), dtype=np.float32)
+
+    def embed_images(self, images):
+        class V:
+            scene = np.zeros(768, dtype=np.float32)
+            text = np.zeros(768, dtype=np.float32)
+
+        return [V() for _ in images]
+
+
+def _ihit(image_id=1, score=0.42, alt="Ada Lovelace", faces=1):
+    from arc_search.serve.repo import ImageHit
+
+    return ImageHit(
+        image_id=image_id,
+        score=score,
+        url="https://conf.test/i/x.png",
+        width=220,
+        height=180,
+        face_count=faces,
+        alt=alt,
+        pages=["https://conf.test/p/"],
+    )
+
+
+class ImageRepo(FakeRepo):
+    def __init__(self, image_hits=None, **kw):
+        super().__init__(**kw)
+        self._image_hits = image_hits if image_hits is not None else [_ihit()]
+        self.urls = {1: "https://conf.test/i/x.png"}
+
+    def hydrate_images(self, hits):
+        return self._image_hits
+
+    def image_url(self, image_id):
+        return self.urls.get(image_id)
+
+
+def _iclient(*, image_hits=None, hits=None, fetch=None, thumbs=None, wired=True):
+    from arc_search.serve.app import ThumbnailCache
+
+    repo = ImageRepo(image_hits=image_hits)
+    iv = FakeImageVectors(hits=hits)
+    deps = Deps(
+        repo=repo,
+        vectors=FakeVectors(),
+        extractor=FakeExtractor(),
+        face_cfg=FaceSettings(),
+        search_cfg=SearchSettings(),
+        crop_root=Path("data/crops"),
+        image_vectors=iv if wired else None,
+        embedder=FakeImageEmbedder() if wired else None,
+        thumbs=thumbs if thumbs is not None else ThumbnailCache(),
+        fetch_image=fetch,
+    )
+    return TestClient(create_app(deps)), deps
+
+
+def test_text_search_uses_the_text_vector_not_the_scene_one():
+    """They are different spaces. Querying scene with a text embedding returns
+    nonsense, and nothing in the response would say so."""
+    client, deps = _iclient()
+    client.get("/text", params={"q": "a fish", "format": "json"})
+    assert deps.image_vectors.last_mode == "text"
+    assert deps.embedder.texts == ["a fish"]
+
+
+def test_similar_uses_the_scene_vector():
+    client, deps = _iclient()
+    client.post(
+        "/similar",
+        files={"photo": ("q.png", make_image(3, "PNG"), "image/png")},
+        params={"format": "json"},
+    )
+    assert deps.image_vectors.last_mode == "scene"
+
+
+def test_text_results_are_labelled_raw_cosine():
+    """SigLIP is sigmoid-loss, so raw cosine is not even the model's own scale,
+    let alone a probability."""
+    client, _ = _iclient()
+    data = client.get("/text", params={"q": "x", "format": "json"}).json()
+    assert data["score_type"] == "raw_cosine"
+    assert data["calibrated"] is False
+    assert data["mode"] == "text"
+
+
+def test_the_image_grid_renders_no_verdict():
+    client, _ = _iclient()
+    body = client.get("/text", params={"q": "a conference logo"}).text
+    assert "UNCALIBRATED" in body
+    for word in ("near certain", "strong match", "confident", "verified"):
+        assert word not in body.lower()
+
+
+def test_face_less_results_are_first_class():
+    """The whole point of ADR-005. An image with no faces must render normally,
+    not be filtered or badged as deficient."""
+    client, _ = _iclient(image_hits=[_ihit(alt=None, faces=0)])
+    body = client.get("/text", params={"q": "a logo"}).text
+    assert "/thumb/1" in body
+    assert "face(s)" not in body, "a face count must not be shown when there are none"
+
+
+def test_the_grid_offers_more_like_this():
+    client, _ = _iclient()
+    assert "/similar/1" in client.get("/text", params={"q": "x"}).text
+
+
+def test_whole_image_modes_degrade_instead_of_erroring():
+    """If the collection or models are unavailable the UI must still serve face
+    search. A UI that will not start is worse than one mode short."""
+    client, _ = _iclient(wired=False)
+    assert client.get("/").status_code == 200
+    assert client.get("/text", params={"q": "x"}).status_code == 503
+    assert "not configured" in client.get("/").text
+
+
+def test_the_home_page_offers_all_three_modes():
+    client, _ = _iclient()
+    body = client.get("/").text
+    assert "/text" in body and "/similar" in body and "/search" in body
+
+
+# --- the thumbnail proxy ---------------------------------------------------
+
+
+class FakeFetched:
+    def __init__(self, body=b"\x89PNG-bytes", content_type="image/png"):
+        self.body = body
+        self.content_type = content_type
+
+
+def test_thumbnails_are_fetched_by_the_server_not_the_browser():
+    """🔴 The privacy property. Rendering <img src='https://theirsite/...'> would
+    have the USER's browser hit the source host, revealing exactly which results
+    they looked at. For a face search engine that inverts the whole premise."""
+    calls = []
+
+    async def fetch(url):
+        calls.append(url)
+        return FakeFetched()
+
+    client, _ = _iclient(fetch=fetch)
+    body = client.get("/text", params={"q": "x"}).text
+    assert "https://conf.test/i/x.png" not in body.split("source page")[0], (
+        "the grid must not point <img> at the source host"
+    )
+
+    r = client.get("/thumb/1")
+    assert r.status_code == 200
+    assert calls == ["https://conf.test/i/x.png"]
+
+
+def test_a_cached_thumbnail_costs_no_fetch():
+    """A politeness token per view would make browsing the index expensive."""
+    calls = []
+
+    async def fetch(url):
+        calls.append(url)
+        return FakeFetched()
+
+    client, _ = _iclient(fetch=fetch)
+    assert client.get("/thumb/1").headers["x-cache"] == "miss"
+    assert client.get("/thumb/1").headers["x-cache"] == "hit"
+    assert len(calls) == 1
+
+
+def test_a_dead_source_image_is_a_404_not_a_500():
+    """Link rot is ~15%/yr; a gone image must not break the page."""
+
+    async def fetch(url):
+        raise RuntimeError("410 gone")
+
+    client, _ = _iclient(fetch=fetch)
+    assert client.get("/thumb/1").status_code == 404
+
+
+def test_an_unknown_image_id_is_a_404():
+    client, _ = _iclient(fetch=None)
+    assert client.get("/thumb/999").status_code == 404
+
+
+def test_the_thumbnail_cache_is_bounded():
+    """⚠️ ADR-001 forbids persisting scene images. An unbounded cache would
+    become exactly the store non-negotiable #1 exists to prevent."""
+    from arc_search.serve.app import ThumbnailCache
+
+    c = ThumbnailCache(max_bytes=100)
+    c.put(1, b"a" * 40, "image/png")
+    c.put(2, b"b" * 40, "image/png")
+    c.put(3, b"c" * 40, "image/png")  # evicts 1
+
+    assert c.get(1) is None
+    assert c.get(3) is not None
+    assert c.stats["bytes"] <= 100
+
+
+def test_an_oversized_image_does_not_evict_the_whole_cache():
+    from arc_search.serve.app import ThumbnailCache
+
+    c = ThumbnailCache(max_bytes=100)
+    c.put(1, b"a" * 40, "image/png")
+    c.put(2, b"x" * 500, "image/png")  # larger than the whole budget
+
+    assert c.get(1) is not None, "a single huge image must not flush everything"
+    assert c.get(2) is None

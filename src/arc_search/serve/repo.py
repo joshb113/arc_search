@@ -41,6 +41,24 @@ class FaceHit:
     pages: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ImageHit:
+    """One whole-image result: scene or text mode.
+
+    ``score`` is RAW COSINE. For the text vector that is not even the model's
+    own scale -- SigLIP is sigmoid-loss. Nothing here converts it to a verdict.
+    """
+
+    image_id: int
+    score: float
+    url: str
+    width: int
+    height: int
+    face_count: int
+    alt: str | None
+    pages: list[str] = field(default_factory=list)
+
+
 class SearchRepo:
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
@@ -151,6 +169,73 @@ class SearchRepo:
                 "suppressed. Expected only mid-backfill, never at rest.",
             )
         return out
+
+    # -- whole-image results (ADR-005) --------------------------------------
+
+    def hydrate_images(self, hits: list[tuple[int, float]]) -> list[ImageHit]:
+        """Turn (image_id, score) pairs into displayable results, in rank order.
+
+        Simpler than ``hydrate`` because the whole-image collection keys points
+        by ``image.id``, so there is no uuid to resolve and no orphan class to
+        guard against -- the point id and the row id are the same thing.
+        """
+        if not hits:
+            return []
+        order = {image_id: i for i, (image_id, _) in enumerate(hits)}
+        scores = dict(hits)
+
+        rows = self._exec(
+            """
+            SELECT i.id,
+                   'https://' || d.host || i.url_path,
+                   i.width, i.height,
+                   i.face_count,
+                   max(t.body),
+                   array_remove(
+                       array_agg(DISTINCT 'https://' || pd.host || u.path), NULL
+                   )
+            FROM image i
+            JOIN domain d ON d.id = i.domain_id
+            LEFT JOIN image_source s ON s.image_id = i.id
+            LEFT JOIN page pg   ON pg.id = s.page_id
+            LEFT JOIN domain pd ON pd.id = pg.domain_id
+            LEFT JOIN url_path u ON u.id = pg.url_path_id
+            LEFT JOIN text_blob t ON t.id = s.alt_text_id
+            WHERE i.id = ANY(%s)
+            GROUP BY i.id, d.host, i.url_path, i.width, i.height, i.face_count
+            """,
+            (list(order),),
+        ).fetchall()
+
+        out = []
+        for r in rows:
+            alt = r[5]
+            if alt and alt.startswith("Photo of "):
+                alt = alt[len("Photo of ") :]
+            out.append(
+                ImageHit(
+                    image_id=r[0],
+                    score=scores[r[0]],
+                    url=r[1],
+                    width=r[2],
+                    height=r[3],
+                    face_count=r[4],
+                    alt=alt,
+                    pages=list(r[6] or []),
+                )
+            )
+        out.sort(key=lambda h: order[h.image_id])
+        return out
+
+    def image_url(self, image_id: int) -> str | None:
+        row = self._exec(
+            """
+            SELECT 'https://' || d.host || i.url_path
+            FROM image i JOIN domain d ON d.id = i.domain_id WHERE i.id = %s
+            """,
+            (image_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     # -- reporting ---------------------------------------------------------
 
