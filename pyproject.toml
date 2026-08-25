@@ -108,6 +108,21 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.flake8-bugbear]
+# B008 forbids function calls in argument defaults, which is exactly how FastAPI
+# declares request parameters -- `photo: UploadFile = File(...)`. These are
+# declarations, not the mutable-default footgun the rule exists to catch, so the
+# alternative would be a noqa on every route signature in serve/.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+]
+
 [tool.mypy]
 python_version = "3.11"
 packages = ["arc_search"]

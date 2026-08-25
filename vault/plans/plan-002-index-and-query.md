@@ -116,14 +116,46 @@ its source page. That is the product working end to end for the first time.
       can no longer tombstone anything. The backfill is re-runnable after
       calibration at the cost of one re-fetch per gated image.
 
-## Phase 3 – Query ⬜
+## Phase 3 – Query ✅
 
-- [ ] Upload-a-photo endpoint, bound to `127.0.0.1`
-- [ ] Report reject-stat breakdown (`too_small` / `too_blurry` / `bad_pose`)
-- [ ] 🔴 **Do not present a score as confidence.** `t_plausible`/`t_strong`/
-      `t_near_certain` are UNCALIBRATED placeholders and `calibrated` is False.
-      Return raw cosine plus the flag; verdicts wait for
-      [[plan-003-precision]]. Non-negotiable #5.
+`src/arc_search/serve/` — FastAPI, 24 tests. Verified end to end against the live
+index: upload a speaker photo, get that speaker back at cosine **1.0000** with
+their crop, weak label and source page; next-best **0.2625**.
+
+```
+PGPASSWORD=... PYTHONPATH=src python -m arc_search.serve.app
+# http://127.0.0.1:8000
+```
+
+- [x] Upload-a-photo endpoint, bound to `127.0.0.1` (verified: the listening
+      socket is `127.0.0.1:8000`, not `0.0.0.0`). `--host` anything else logs
+      `serve.non_loopback_bind` rather than doing it quietly.
+- [x] Report reject-stat breakdown — shown on the "no usable face" page, because
+      *"no faces found"* with no reason is what makes an engine feel broken.
+- [x] 🔴 **No verdict is rendered.** The page carries an UNCALIBRATED banner,
+      shows raw cosine, and a test asserts the words *near certain*, *strong
+      match*, *confident*, *verified* appear nowhere. JSON says
+      `"score_type": "raw_cosine"`. Banner and score meaning change together
+      when `calibrated` flips.
+- [x] **The uploaded photo is never written to disk** — read, decoded, embedded,
+      dropped. Pinned by a test that snapshots the filesystem around a request.
+- [x] **The opt-out list is consulted on every search**, pushed into Qdrant as a
+      server-side `must_not` so a suppressed face cannot consume one of the k
+      slots. ⚠️ Materialises the whole list; past ~1k exclusions, flip to a
+      payload flag set on insert.
+- [x] Crop serving with a path check — the value comes from our own database,
+      but is still resolved against the crop root, because "it came from the DB"
+      is how a traversal becomes possible later.
+- [x] Orphan vectors are dropped, not displayed, and logged as
+      `serve.orphan_vectors`.
+
+### Still open
+
+- [ ] Multi-face uploads use only the **highest-quality** face. A group photo
+      should offer a choice of which face to search on.
+- [ ] No pagination — `return_k` results in one page.
+- [ ] No identity clustering, so the same person across years appears as
+      separate rows rather than one grouped result. → [[plan-003-precision]]
 
 ---
 

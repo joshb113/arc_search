@@ -32,7 +32,7 @@ of them is stale and it is usually this one.
 ```
 src/arc_search/crawler/   frontier, politeness, extraction, fetch, run, seeds
 src/arc_search/index/     dedup, faces, store, vectors, backfill
-src/arc_search/serve/     NOT WRITTEN — plan-002 Phase 3
+src/arc_search/serve/     app (FastAPI), repo (read-only Postgres)
 src/arc_search/eval/      NOT WRITTEN — weeks 3-6
 sql/schema.sql            applied automatically by docker compose initdb
 tools/                    profile_crawl_loop.py
@@ -87,11 +87,18 @@ the full build shadows the headless one.
 **Qdrant.** `docker compose up -d qdrant`, HTTP on 6333. Collection `faces`,
 created by `VectorStore.ensure_collection()`.
 
-**Running the backfill.**
+**Running the backfill, and the UI.**
 
 ```
-PGPASSWORD=... python -m arc_search.index.backfill [--limit N] [--rps R] [--dry-run]
+PGPASSWORD=... PYTHONPATH=src python -m arc_search.index.backfill [--limit N] [--rps R] [--dry-run]
+PGPASSWORD=... PYTHONPATH=src python -m arc_search.serve.app      # http://127.0.0.1:8000
 ```
+
+⚠️ **Do not inspect JSON with `curl ... | python -m json.tool`.** On Windows that
+decodes the UTF-8 stream as cp1252 and re-escapes it, so a clean `è` comes back
+as `Ã¨` and looks exactly like a database encoding bug. It cost a false alarm
+here. Write the body to a file and open it with `encoding='utf-8'`. The corpus
+is clean: **0 mojibake across 2,726 labels**, 248 of them non-ASCII.
 
 🔴 **Stop the crawler first, or pass `--rps`.** Politeness state is per-process
 and in-memory, so a backfill and a crawl against the same host each spend their
@@ -198,12 +205,18 @@ Postgres, Qdrant and on disk, all three agreeing exactly, 0 unexamined and
 0 tombstoned. A photo goes in and the right person comes back — including the
 same person in a *different year*, across 143 multi-year speakers.
 
-**Next:** plan-002 Phase 3 — the upload-a-photo endpoint. The query path is
-already proven; what is missing is `serve/`.
+**plan-002 is complete.** `serve/` is written and verified against the live
+index — upload a speaker photo at `http://127.0.0.1:8000`, get that speaker back
+at cosine 1.0000 with their crop, weak label and source page.
 
-🔴 **Do not render a verdict in the UI.** `calibrated` is False and
-`t_plausible`/`t_strong`/`t_near_certain` are placeholders — one impostor pair
-already scores **0.651**, above `t_near_certain`. Show raw cosine plus the flag.
+🔴 **The UI renders no verdict, and that is load-bearing.** `calibrated` is False
+and `t_plausible`/`t_strong`/`t_near_certain` are placeholders — one impostor
+pair already scores **0.651**, above `t_near_certain`. The page shows raw cosine
+behind an UNCALIBRATED banner, and a test asserts no verdict language appears.
+Do not add one before [[plan-003-precision]] runs.
+
+**Next:** plan-003 — but PDQ first (see the trap above); it is a prerequisite,
+not a parallel task.
 
 See [[research/first-index-and-calibration-preview]] and
 [[research/face-model-bringup]].
