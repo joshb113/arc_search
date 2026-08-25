@@ -90,23 +90,66 @@ def test_the_shipped_env_example_has_no_typos():
     assert unknown_settings(keys) == []
 
 
-# --- filter thresholds must stay coupled to the face gate ------------------
+# --- the crawl-time size gate ----------------------------------------------
 
 
-def test_min_image_dim_is_not_above_the_minimum_face_size():
-    """min_image_dim is DERIVED from min_face_px, not chosen independently.
+def test_min_image_dim_is_no_longer_derived_from_the_face_gate():
+    """⚠️ THE OLD DERIVATION IS VOID, and this test replaced it.
 
-    The justification is: an image whose shorter side is smaller than the
-    smallest face we would accept cannot contain a qualifying face. If someone
-    raises min_image_dim above min_face_px, that reasoning stops holding and
-    the crawler starts discarding images that would have produced usable faces
-    -- silently, with no error and no log line.
+    It used to assert ``min_image_dim <= min_face_px``, justified by: an image
+    shorter than the smallest acceptable FACE cannot contain one. ADR-005 made
+    image search primary, and that argument says nothing whatever about the
+    smallest image worth indexing for *visual* search -- a 60px logo has no
+    face in it and is corpus.
 
-    This is not hypothetical. min_image_dim shipped at 200 while FOSDEM speaker
-    photos are 165-180px on the short side: it rejected 9 of 9 sampled images.
-    A whole corpus, no diagnostic.
+    Keeping the old assertion would have been worse than deleting it: a green
+    test enforcing reasoning nobody believes any more, which is how a dead
+    argument survives a change of goal.
+
+    What replaces it is a measurement (vault/research/image-size-gate.md):
+    scene-embedding self-similarity under downscaling, on real corpus images.
+
+        short side   128    96     64     48     32     16
+        scene mean   0.988  0.965  0.938  0.906  0.840  0.634
+        text  mean   0.988  0.976  0.952  0.936  0.909  0.813
+
+    Two things follow, and neither is "raise the gate":
+
+    1. **Text degrades far more slowly than scene.** Text is the primary mode
+       under ADR-005 and is still 0.909 at 32px, where scene has fallen to
+       0.840. A gate tuned for scene would throw away images text search can
+       still use.
+    2. **Exclusion at crawl time is IRREVERSIBLE.** Nothing stores scene pixels,
+       so an image the gate rejects needs a whole recrawl to recover, while an
+       image admitted and later judged useless costs a filter at query time.
+       That is ADR-004's asymmetry exactly, and it points at a LOW gate.
+
+    So the number stays 48 and is now justified on its own terms: a floor
+    against tracking pixels and spacers, not a quality judgement. Measured on
+    this corpus it excludes **0 of 4,753 images** -- it is not currently binding
+    at all, which is the right place for a gate nobody has calibrated.
     """
-    assert CrawlSettings().min_image_dim <= FaceSettings().min_face_px
+    cfg = CrawlSettings()
+    assert cfg.min_image_dim == 48
+
+    # The point is the absence of coupling. This must NOT be re-derived from the
+    # face gate; min_face_px can move for face reasons without dragging the
+    # crawl gate with it.
+    assert cfg.min_image_dim < 64, (
+        "the crawl gate should stay well below where scene similarity degrades "
+        "(min 0.86 at 96px), because admitting a marginal image is reversible "
+        "and excluding it at crawl time is not"
+    )
+
+
+def test_the_size_gate_does_not_encode_a_quality_judgement():
+    """Quality is decided after retrieval, where it is reversible.
+
+    The gate's job is to skip tracking pixels and spacer GIFs. Anything larger
+    is a question for ranking, not for admission -- and ranking can be changed
+    without a recrawl.
+    """
+    assert CrawlSettings().min_image_dim <= 64
 
 
 def test_min_image_bytes_stays_a_bandwidth_filter_not_a_quality_gate():

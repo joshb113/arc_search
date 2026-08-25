@@ -76,13 +76,29 @@ class CrawlSettings(BaseSettings):
     # A 180x180 portrait is a perfectly good face image. The old 200 came from
     # nowhere and would have produced an empty index with no error anywhere.
 
-    # DERIVED from FaceSettings.min_face_px, not picked. An image whose shorter
-    # side is smaller than the smallest face we would accept cannot contain a
-    # qualifying face -- that is the entire justification, and it is why these
-    # two must move together. test_config.py pins the relationship.
+    # ⚠️ NO LONGER derived from FaceSettings.min_face_px. That derivation --
+    # "an image shorter than the smallest acceptable FACE cannot contain one" --
+    # was voided by ADR-005: a 60px logo has no face in it and is corpus.
     #
-    # Moved 64 -> 48 on 2026-08-24 because min_face_px did; see the derivation
-    # there. The invariant, not this literal, is the thing to preserve.
+    # RE-DERIVED 2026-08-25 against the thing it now gates, visual search.
+    # Scene-embedding self-similarity under downscaling, real corpus images
+    # (vault/research/image-size-gate.md):
+    #
+    #     short side   128    96     64     48     32     16
+    #     scene mean   0.988  0.965  0.938  0.906  0.840  0.634
+    #     text  mean   0.988  0.976  0.952  0.936  0.909  0.813
+    #
+    # Text degrades far more slowly than scene and is the PRIMARY mode now, so a
+    # gate tuned for scene would discard images text search can still use.
+    #
+    # And the asymmetry decides it, exactly as in ADR-004: excluding an image
+    # here is IRREVERSIBLE -- no scene pixels are stored, so a rejected image
+    # needs a recrawl -- while admitting a marginal one costs a filter at query
+    # time. So this stays low and is not a quality judgement. Its only job is to
+    # skip tracking pixels and spacer GIFs.
+    #
+    # Measured on the live corpus: at 48 this excludes 0 of 4,753 images. It is
+    # not currently binding, which is where an uncalibrated gate belongs.
     min_image_dim: int = 48
 
     # A BANDWIDTH heuristic, not a quality gate. Its only job is to avoid

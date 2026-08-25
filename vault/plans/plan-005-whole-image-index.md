@@ -125,19 +125,33 @@ bearded man; scene more-like-this from the fish scores 1.000 against ~0.01.
       `too_small`/`bad_pose` equivalent — every image gets a vector. The only
       exclusion is `min_image_dim`, which is uncalibrated (below).
 
-## Phase 3 – Face-less images become first-class ⬜
+## Phase 3 – Face-less images become first-class ✅
 
-- [ ] 🔴 **Remove the `face_count == 0` tombstone.** Four sites in
-      `index/dedup.py`: `:156` (load), `:165` (check_bytes), `:181` (mark_barren),
-      `:194` (register). Under a face goal, "no face, never look again" is a good
-      optimization; under an image goal it deletes most of the corpus.
-- [ ] ⚠️ **`min_image_dim = 48` is now underived.** It was derived from
-      `min_face_px` — *"an image whose shorter side is smaller than the smallest
-      face we would accept cannot contain a qualifying face"* — and that argument
-      is void when face-less images are wanted. `test_config.py` pins the
-      relationship and **will need to change**; do not just re-type the number.
-      Re-measure under non-negotiable #5: what is the smallest image worth
-      indexing for *visual* search?
+- [x] ~~**Remove the `face_count == 0` tombstone.**~~ **NOT DONE — the premise
+      was wrong, and it was wrong in this plan.** Traced through the code rather
+      than assumed:
+      `BARREN` and `EXACT_DUP` are handled **identically** in
+      `PostgresWriter.handle` (both link provenance and return); nothing outside
+      `dedup.py` reads `BARREN`; and the embed path never consults `face_count`
+      at all. An image in `_barren` is **already in the `image` table** — the
+      tombstone gates the FACE queue, not corpus membership.
+      Face-less images were already first-class. `face_count = 0` means "the
+      detector has looked, do not run it again", which stays correct under an
+      image goal. Left in place. → [[research/image-size-gate]]
+- [x] **`min_image_dim` re-derived, 2026-08-25.** → [[research/image-size-gate]].
+      Measured scene-embedding self-similarity under downscaling on real corpus
+      images. **The number stays 48; the justification is entirely new.**
+      🔴 **Text degrades far more slowly than scene** (0.909 vs 0.840 at 32px),
+      and text is the primary mode — a gate tuned for scene would discard images
+      text search can still use.
+      🔴 The deciding argument is ADR-004's asymmetry: excluding at crawl time is
+      **irreversible** (no scene pixels are stored, so it needs a recrawl) while
+      admitting a marginal image costs a filter at query time. So the gate stays
+      low and is not a quality judgement.
+      Measured: at 48 it excludes **0 of 4,753** images — not binding, which is
+      where an uncalibrated gate belongs. The old
+      `min_image_dim <= min_face_px` test is gone; keeping a green assertion for
+      dead reasoning is how a void argument survives a change of goal.
 - [ ] Revisit `deny_patterns`. They were tuned to discard face-less images —
       run 2 cut 33 images to 8 and called it a 4.9× bandwidth win. Those 25
       sponsor logos and venue maps are **corpus** now.

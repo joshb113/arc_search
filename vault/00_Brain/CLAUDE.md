@@ -215,18 +215,20 @@ minutes of CPU and ~80 MB. Distinguish by CPU time, not by count.
   a mailing-list archive with no faces and tens of thousands of pages. Carve
   those out with `deny_hosts`.
 - **Thresholds are measured, never chosen.** `min_image_dim` shipped at 200 and
-  rejected 9 of 9 real speaker photos (165–180 px). It is now 48, *derived* from
-  `min_face_px`, with a test pinning the relationship.
-  🔴 **That derivation is VOID under [[decisions/ADR-005-image-search-is-primary]].**
-  The argument was "an image shorter than the smallest acceptable *face* cannot
-  contain one" — which says nothing about the smallest image worth indexing for
-  *visual* search. `test_config.py` pins the relationship and will need to change.
-  **Re-measure it; do not just re-type the number.**
-- 🔴 **`face_count == 0` still tombstones, and must stop.** Four sites in
-  `index/dedup.py` (`:156`, `:165`, `:181`, `:194`). Correct for a face engine;
-  under an image engine it discards most of the corpus. Harmless *today* only
-  because ADR-004 means there are zero tombstones — every face-less image is
-  `-2`, so all 1,886 are still present and re-embeddable.
+  rejected 9 of 9 real speaker photos (165–180 px).
+  **Re-derived 2026-08-25** ([[research/image-size-gate]]) after ADR-005 voided
+  its old justification. It is still **48**, but no longer coupled to
+  `min_face_px` — that test is gone, because a green assertion enforcing dead
+  reasoning is how a void argument survives a change of goal.
+  🔴 **Text degrades far more slowly than scene** (0.909 vs 0.840 at 32px) and
+  text is the primary mode. 🔴 Excluding at crawl time is **irreversible** (no
+  scene pixels stored → recrawl) while admitting a marginal image costs a query
+  filter, so the gate stays low. At 48 it excludes **0 of 4,753** images.
+- ~~**`face_count == 0` tombstones and must stop.**~~ **Premise was wrong.**
+  `BARREN` and `EXACT_DUP` are handled identically in `handle()` — both link and
+  return — nothing outside `dedup.py` reads `BARREN`, and the embed path never
+  consults `face_count`. It gates the FACE queue, not corpus membership.
+  Face-less images were always first-class. Left in place.
 - **`--max-pages` is a per-run cap, not a verdict.** Budget-skipped URLs are
   released back to PENDING; they must never be `complete()`d.
 - **Anything needed on dequeue must be IN the queue.** Image provenance lived

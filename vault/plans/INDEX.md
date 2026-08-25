@@ -67,6 +67,10 @@ is [[plan-005-whole-image-index]], written 2026-08-25.
   verified. DINOv2 **768-d / 179 img/s**, SigLIP2 **768-d / 93 img/s**, both discriminating
   on real corpus images. Storage recomputed: **280 GB** vs **96 GB** on one config flag.
   ⚠️ The 512-d truncation option is **withdrawn as uncosted** — n=7 could not test it.
+- [[image-size-gate]] — re-derives `min_image_dim` for visual search after ADR-005
+  voided its old justification. The number stays 48; the reasoning is new. Also records
+  that plan-005's "remove the face_count tombstone" item rested on a **wrong premise** —
+  traced through the code, `BARREN` never excluded anything from the corpus.
 - [[first-index-and-calibration-preview]] — the first full index: 1,300 faces, 0
   failures across 2,219 re-fetches, identity matching working across years. Plus a
   calibration preview and the reason it is **not** a calibration: 66% of labeled
